@@ -36,8 +36,27 @@ export interface EnvironmentLimitsStatus {
   readonly environmentLabel: string | null;
   readonly isPending: boolean;
   readonly snapshots: readonly AccountLimitsSnapshot[] | null;
+  /** The server's own clock when it wrote the summary. */
+  readonly readAt: string | null;
+  /** This client's clock when the summary arrived - `readAt`'s local twin. */
+  readonly receivedAtMs: number | null;
   /** Streamed provider config; the source of instance display names. */
   readonly providers: readonly ServerProvider[] | null;
+}
+
+/**
+ * When each summary object was first seen, keyed by identity: the atom
+ * re-evaluates on unrelated changes, and re-stamping a cached summary would
+ * quietly grow the skew estimate until fresh rows rendered as future ones.
+ */
+const summaryReceivedAtMs = new WeakMap<object, number>();
+function receivedAtFor(summary: object): number {
+  let at = summaryReceivedAtMs.get(summary);
+  if (at === undefined) {
+    at = Date.now();
+    summaryReceivedAtMs.set(summary, at);
+  }
+  return at;
 }
 
 const accountLimitsAtom = Atom.make((get): readonly EnvironmentLimitsStatus[] => {
@@ -46,15 +65,16 @@ const accountLimitsAtom = Atom.make((get): readonly EnvironmentLimitsStatus[] =>
   for (const [environmentId, presentation] of presentations) {
     const result = get(serverEnvironment.accountLimits({ environmentId, input: {} }));
     const summary = Option.getOrNull(AsyncResult.value(result));
+    const accepted =
+      summary !== null && ACCOUNT_LIMITS_ACCEPTED_VERSIONS.includes(summary.contractVersion);
     statuses.push({
       environmentId,
       environmentLabel: presentation.entry.target.label ?? null,
       providers: presentation.serverConfig?.providers ?? null,
       isPending: result.waiting,
-      snapshots:
-        summary === null || !ACCOUNT_LIMITS_ACCEPTED_VERSIONS.includes(summary.contractVersion)
-          ? null
-          : summary.snapshots,
+      snapshots: accepted ? summary.snapshots : null,
+      readAt: accepted ? summary.readAt : null,
+      receivedAtMs: accepted ? receivedAtFor(summary) : null,
     });
   }
   return statuses;
@@ -78,6 +98,13 @@ export interface AccountLimitsRow {
    * showing.
    */
   readonly instanceLabel: string;
+  /**
+   * Client clock minus server clock, estimated at arrival. `asOf` is stamped
+   * by the environment's server; ages rendered against this client's clock
+   * add this correction so a machine hours off does not paint every fresh
+   * row stale (or every stale row fresh).
+   */
+  readonly clockSkewMs: number;
   readonly snapshot: AccountLimitsSnapshot;
 }
 
@@ -112,31 +139,65 @@ export function mergeEnvironmentLimits(
         byInstance.set(key, snapshot);
       }
     }
+    const skewMs =
+      status.readAt !== null && status.receivedAtMs !== null
+        ? status.receivedAtMs - Date.parse(status.readAt)
+        : Number.NaN;
     for (const snapshot of byInstance.values()) {
       const instanceId = snapshot.instanceId ?? legacyInstanceIdFor(snapshot.provider);
+      const provider = status.providers?.find((candidate) => candidate.instanceId === instanceId);
+      const authEmail =
+        provider?.auth.status === "authenticated" ? (provider.auth.email ?? null) : null;
+      const accountEmail = authEmail !== null && authEmail.trim() !== "" ? authEmail : null;
+      // "Byte-identical" must mean the whole row: keying on the stamp alone
+      // would let two environments' same-instant-but-different readings
+      // collapse into one, silently deleting a real account's numbers.
       const duplicateKey = JSON.stringify([
         snapshot.provider,
         instanceId,
         snapshot.asOf,
         snapshot.source,
+        snapshot.plan,
+        snapshot.windows,
+        accountEmail,
       ]);
       if (seen.has(duplicateKey)) continue;
       seen.add(duplicateKey);
-      const provider = status.providers?.find((candidate) => candidate.instanceId === instanceId);
       const rows = byProvider.get(snapshot.provider) ?? [];
-      const authEmail =
-        provider?.auth.status === "authenticated" ? (provider.auth.email ?? null) : null;
       rows.push({
         environmentId: status.environmentId,
         environmentLabel: status.environmentLabel,
-        accountEmail: authEmail !== null && authEmail.trim() !== "" ? authEmail : null,
+        accountEmail,
         instanceLabel: provider?.displayName ?? instanceId,
+        clockSkewMs: Number.isFinite(skewMs) ? skewMs : 0,
         snapshot,
       });
       byProvider.set(snapshot.provider, rows);
     }
   }
   for (const rows of byProvider.values()) {
+    // A display name shared by two DIFFERENT instances identifies nothing -
+    // two unnamed Codex accounts must not both caption as "Codex". Those
+    // rows fall back to their raw instance id, which is unique per
+    // environment. Rows sharing one instance across environments keep the
+    // shared name; the environment label disambiguates them in rendering.
+    const instancesPerLabel = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const instanceId = row.snapshot.instanceId ?? legacyInstanceIdFor(row.snapshot.provider);
+      const ids = instancesPerLabel.get(row.instanceLabel) ?? new Set<string>();
+      ids.add(instanceId);
+      instancesPerLabel.set(row.instanceLabel, ids);
+    }
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index];
+      if (row === undefined) continue;
+      if ((instancesPerLabel.get(row.instanceLabel)?.size ?? 0) > 1) {
+        rows[index] = {
+          ...row,
+          instanceLabel: row.snapshot.instanceId ?? legacyInstanceIdFor(row.snapshot.provider),
+        };
+      }
+    }
     rows.sort(
       (a, b) =>
         a.instanceLabel.localeCompare(b.instanceLabel) ||

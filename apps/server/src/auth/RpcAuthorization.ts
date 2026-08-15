@@ -47,7 +47,9 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.serverRetryResourceTelemetry]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverGetUsageSummary]: AuthOrchestrationReadScope,
   [WS_METHODS.serverGetAccountLimits]: AuthOrchestrationReadScope,
-  [WS_METHODS.serverRefreshAccountLimits]: AuthOrchestrationReadScope,
+  // Spawns provider processes (SDK query, codex app-server, grok TUI boot),
+  // so it is an operation, not a read - serverRefreshProviders' own precedent.
+  [WS_METHODS.serverRefreshAccountLimits]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverSignalProcess]: AuthOrchestrationOperateScope,
   [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
   [WS_METHODS.serverReportHostPowerState]: AuthOrchestrationOperateScope,

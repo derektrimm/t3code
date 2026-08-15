@@ -43,6 +43,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import { ServerConfig } from "../config.ts";
@@ -59,6 +60,7 @@ import {
   codexSnapshotFromUnknown,
   isPrimaryCodexLimit,
   sortWindows,
+  windowHasTraffic,
 } from "./accountLimitsNormalize.ts";
 import { pullClaudeLimits, pullCodexLimits, pullGrokBillingRefresh } from "./accountLimitsPull.ts";
 import { readLatestCodexRateLimits, readLatestGrokCredits } from "./accountLimitsTranscripts.ts";
@@ -67,6 +69,8 @@ import { readLatestCodexRateLimits, readLatestGrokCredits } from "./accountLimit
 const CODEX_SEED_MIN_INTERVAL_MS = 60_000;
 /** A grok log line younger than this needs no TUI boot on refresh. */
 const GROK_BOOT_FRESH_MS = 60_000;
+/** Concurrent refresh callers inside this window share one execution. */
+const REFRESH_SHARE_TTL_MS = 1_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -166,6 +170,16 @@ function providerFromDriver(driver: string): AccountLimitsProviderKind | null {
 }
 
 /**
+ * The limits provider an instance driver FEEDS - eviction's question, wider
+ * than ingest's: grok never ingests (see above), but its instances own grok
+ * rows all the same, and an eviction pass using the ingest mapping would
+ * read every grok row as "wrong driver" and delete it.
+ */
+function limitsProviderForDriver(driver: string): AccountLimitsProviderKind | null {
+  return driver === "grok" ? "grok" : providerFromDriver(driver);
+}
+
+/**
  * The instance that owns data carrying no instance id: legacy emitters and
  * v1 cache rows. The legacy single-instance world used the driver kind
  * itself as the instance id (see `defaultInstanceIdForDriver`), so this is
@@ -252,6 +266,7 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
      * migrated row may belong to somebody else, so it is evicted rather than
      * shown as a ghost account forever.
      */
+    const hostEnvironment = yield* HostProcessEnvironment;
     const migratedSlots = new Set<string>();
     const cachePath = path.join(config.stateDir, "account-limits.json");
     let lastCodexSeedAttemptAtMs = 0;
@@ -302,7 +317,16 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
       fileSystem.realPath(dir).pipe(Effect.catchCause(() => Effect.succeed(dir)));
 
     const persist = Effect.fn("AccountLimitsService.persist")(function* () {
-      yield* encodeLimitsCache([...snapshots.values()]).pipe(
+      // A still-unconfirmed migrated row is written back in its v1 shape (no
+      // instanceId): the marker lives only in memory, and persisting the
+      // synthesized id would make the row look settled after any restart -
+      // permanently exempt from the other-instance eviction in `store`.
+      const rows = [...snapshots.entries()].map(([key, snapshot]) => {
+        if (!migratedSlots.has(key)) return snapshot;
+        const { instanceId: _instanceId, ...rest } = snapshot;
+        return rest;
+      });
+      yield* encodeLimitsCache(rows).pipe(
         Effect.flatMap((serialized) =>
           writeFileStringAtomically({ filePath: cachePath, contents: serialized }),
         ),
@@ -354,13 +378,19 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
         return;
       }
       // The streamed event names one window; patch it into whatever set the
-      // last full snapshot from the same instance established.
+      // last full snapshot from the same instance established. The same
+      // traffic filter the full-snapshot path applies holds here, or a
+      // never-metered window a full snapshot suppressed would resurface
+      // through one streamed 0% event.
       const window = claudeWindowFromRateLimitEvent(payload);
       if (window === null) return;
-      const windows = sortWindows([
-        ...(previous?.windows ?? []).filter((existing) => existing.id !== window.id),
-        window,
-      ]);
+      const windows = sortWindows(
+        [
+          ...(previous?.windows ?? []).filter((existing) => existing.id !== window.id),
+          window,
+        ].filter(windowHasTraffic),
+      );
+      if (windows.length === 0) return;
       yield* store({
         provider: "claude",
         instanceId,
@@ -429,7 +459,7 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
      * ambient GROK_HOME redirects the default instance's CLI - and this seed
      * must read where that CLI actually writes, not ~/.grok unconditionally.
      */
-    const defaultGrokHome = () => expandHomePath(process.env["GROK_HOME"]?.trim() || "~/.grok");
+    const defaultGrokHome = () => expandHomePath(hostEnvironment["GROK_HOME"]?.trim() || "~/.grok");
 
     /**
      * A grok instance's home. `getSettings` has already materialized sensitive
@@ -470,13 +500,30 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
             Effect.catchCause(() => Effect.succeed(null)),
           );
           if (codexSettings === null) continue;
-          const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
-            Effect.provideService(Path.Path, path),
-          );
+          // Where the spawned CLI actually writes: an explicit homePath wins,
+          // else the CODEX_HOME its child env would carry (instance override,
+          // then ambient) - resolveCodexHomeLayout alone answers ~/.codex
+          // even when the CLI it describes is writing somewhere else.
+          let sessionsParent: string;
+          const codexEnvOverride = entry.environment
+            ?.find((variable) => variable.name === "CODEX_HOME")
+            ?.value.trim();
+          const codexEnvHome =
+            codexSettings.homePath.trim() === ""
+              ? codexEnvOverride || hostEnvironment["CODEX_HOME"]?.trim() || ""
+              : "";
+          if (codexEnvHome !== "") {
+            sessionsParent = expandHomePath(codexEnvHome);
+          } else {
+            const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
+              Effect.provideService(Path.Path, path),
+            );
+            sessionsParent = layout.sharedHomePath;
+          }
           targets.push({
             provider: "codex",
             instanceId: ProviderInstanceId.make(rawInstanceId),
-            sourceDir: yield* canonicalDir(path.join(layout.sharedHomePath, "sessions")),
+            sourceDir: yield* canonicalDir(path.join(sessionsParent, "sessions")),
             enabled: entry.enabled !== false,
           });
         } else if (entry.driver === "grok") {
@@ -496,14 +543,22 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
           const read = yield* Effect.promise(() =>
             readLatestGrokCredits(path.join(target.sourceDir, "unified.jsonl"), nowMs),
           );
-          if (read._tag === "expired") {
-            // The newest billing record's period has ended: whatever the cache
-            // holds for this instance belongs to a window that no longer
-            // exists, and keeping it would show a dead percentage "resetting
-            // now" forever.
+          if (read._tag === "expired" || read._tag === "superseded") {
+            // Expired: the newest record's period has ended. Superseded: the
+            // newest record carries no usable reading (unmetered seat or
+            // reshaped payload). Either way the cached row describes a state
+            // the vendor has since replaced, and keeping it would serve a
+            // dead paid percentage as current. Guarded by the verdict line's
+            // own timestamp: a concurrent refresh may have stored a NEWER
+            // live reading between this lock-free log read and here, and a
+            // stale verdict must not delete it.
+            const expiredAsOf = DateTime.formatIso(DateTime.makeUnsafe(read.asOfMs));
             yield* stateLock.withPermits(1)(
               Effect.gen(function* () {
-                if (snapshots.delete(slotKey("grok", target.instanceId))) yield* persist();
+                const cached = snapshots.get(slotKey("grok", target.instanceId));
+                if (cached === undefined || cached.asOf > expiredAsOf) return;
+                snapshots.delete(slotKey("grok", target.instanceId));
+                yield* persist();
               }),
             );
             continue;
@@ -556,7 +611,15 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
             for (const [key, snapshot] of snapshots) {
               const instanceId =
                 snapshot.instanceId ?? defaultInstanceIdForProvider(snapshot.provider);
-              if (configMap[instanceId] === undefined) {
+              const entry = configMap[instanceId];
+              // Gone entirely, or reconfigured to a different driver: either
+              // way the row's data belongs to an account this id no longer
+              // names, and a stale row would be captioned with the NEW
+              // driver's display name and email.
+              if (
+                entry === undefined ||
+                limitsProviderForDriver(entry.driver) !== snapshot.provider
+              ) {
                 snapshots.delete(key);
                 migratedSlots.delete(key);
                 evicted = true;
@@ -609,7 +672,7 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
      * decision is "not supported here". A failed pull skips; refresh must
      * never break the panel it refreshes.
      */
-    const refresh = Effect.fn("AccountLimitsService.refresh")(function* () {
+    const refreshOnce = Effect.fn("AccountLimitsService.refresh")(function* () {
       yield* ensureLoaded;
       const settings = yield* settingsService.getSettings.pipe(
         Effect.catchCause(() => Effect.succeed(null)),
@@ -617,7 +680,6 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
       const configMap = settings === null ? null : deriveProviderInstanceConfigMap(settings);
       if (configMap !== null) {
         const nowMs = yield* Clock.currentTimeMillis;
-        const nowIso = DateTime.formatIso(DateTime.makeUnsafe(nowMs));
         const jobs: Effect.Effect<void>[] = [];
         for (const [rawInstanceId, entry] of Object.entries(configMap)) {
           if (entry.enabled === false) continue;
@@ -632,11 +694,17 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
                 Effect.flatMap((payload) =>
                   payload === null || payload === undefined
                     ? Effect.void
-                    : ingest({
-                        provider: "claudeAgent",
-                        payload,
-                        createdAt: nowIso,
-                        providerInstanceId: ProviderInstanceId.make(rawInstanceId),
+                    : Effect.gen(function* () {
+                        // Stamped at completion, not refresh start: a pull can
+                        // take seconds, and a start-time stamp would lose the
+                        // ordering guard to any live event landing mid-pull.
+                        const completedAtMs = yield* Clock.currentTimeMillis;
+                        yield* ingest({
+                          provider: "claudeAgent",
+                          payload,
+                          createdAt: DateTime.formatIso(DateTime.makeUnsafe(completedAtMs)),
+                          providerInstanceId: ProviderInstanceId.make(rawInstanceId),
+                        });
                       }),
                 ),
               ),
@@ -691,11 +759,15 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
                 Effect.flatMap((payload) =>
                   payload === null || payload === undefined
                     ? Effect.void
-                    : ingest({
-                        provider: "codex",
-                        payload,
-                        createdAt: nowIso,
-                        providerInstanceId: ProviderInstanceId.make(rawInstanceId),
+                    : Effect.gen(function* () {
+                        // Completion-stamped - see the claude arm.
+                        const completedAtMs = yield* Clock.currentTimeMillis;
+                        yield* ingest({
+                          provider: "codex",
+                          payload,
+                          createdAt: DateTime.formatIso(DateTime.makeUnsafe(completedAtMs)),
+                          providerInstanceId: ProviderInstanceId.make(rawInstanceId),
+                        });
                       }),
                 ),
               ),
@@ -712,6 +784,14 @@ export const make = (pullers?: Partial<AccountLimitsPullers>) =>
       }
       return yield* readSummary();
     });
+
+    // One in-flight refresh serves every caller: two clients clicking at once
+    // must not double the process spawns. cachedWithTTL shares the running
+    // computation and briefly holds its result; the TTL sits far below the
+    // grok freshness window, so it coalesces bursts without making the
+    // button a no-op.
+    const refreshShared = yield* Effect.cachedWithTTL(refreshOnce(), REFRESH_SHARE_TTL_MS);
+    const refresh = () => refreshShared;
 
     return { readSummary, ingest, refresh } as const;
   });

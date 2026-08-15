@@ -161,13 +161,38 @@ export const pullGrokBillingRefresh = (
     if (platform !== "linux" && platform !== "darwin") return;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const bootEnvironment = { ...environment, GROK_HOME: home, GROK_DISABLE_AUTOUPDATER: "1" };
-    // Single-quote the binary for the `sh -c` layer `script -c` runs it
+    // Single-quote for the `sh -c` layer `script -c` runs the command
     // through; a path with single quotes gets the standard '"'"' splice.
-    const quoted = `'${binaryPath.replaceAll("'", `'"'"'`)}'`;
+    const shellQuote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+    const quoted = shellQuote(binaryPath);
+    // Two servers can share one home (worktree checkouts on one machine), and
+    // the per-process refresh coalescing cannot see across them - so the
+    // linux boot takes a home-scoped flock and yields to whoever holds it.
+    // The lock rides an fd the exec chain carries into grok itself (released
+    // exactly when the boot dies) - NOT `flock <file> <cmd>`, whose
+    // intermediate process leaves the TUI outside the pty's foreground
+    // group: it boots, hangs before its billing fetch, and logs nothing
+    // (measured; the fd-passing form fetches every time). Darwin has no
+    // flock(1); its BSD `script` also runs the command in a fresh pty
+    // session OUTSIDE the killable process group, so the deadline must ride
+    // inside: perl's alarm survives exec, and macOS ships perl.
+    const quotedLock = shellQuote(`${home}/.t3-limits-boot.lock`);
     const args =
       platform === "linux"
-        ? ["-qec", `exec timeout ${GROK_BOOT_SECONDS} ${quoted}`, "/dev/null"]
-        : ["-q", "/dev/null", binaryPath];
+        ? [
+            "-qec",
+            `mkdir -p ${shellQuote(home)} && exec 9>${quotedLock} && flock -n 9 && exec timeout ${GROK_BOOT_SECONDS} ${quoted}`,
+            "/dev/null",
+          ]
+        : [
+            "-q",
+            "/dev/null",
+            "perl",
+            "-e",
+            "alarm shift; exec @ARGV",
+            String(GROK_BOOT_SECONDS),
+            binaryPath,
+          ];
     const child = yield* spawner.spawn(
       ChildProcess.make("script", args, {
         env: bootEnvironment,

@@ -92,8 +92,20 @@ function LimitMeter({ window, color }: { window: AccountLimitsWindow; color: str
  * indistinguishable. Past the staleness threshold the tone warms so an
  * aging snapshot is visible before it is a problem.
  */
-function SnapshotAge({ snapshot, nowMs }: { snapshot: AccountLimitsSnapshot; nowMs: number }) {
-  const ageMs = nowMs - Date.parse(snapshot.asOf);
+function SnapshotAge({
+  snapshot,
+  nowMs,
+  clockSkewMs,
+}: {
+  snapshot: AccountLimitsSnapshot;
+  nowMs: number;
+  clockSkewMs: number;
+}) {
+  // `asOf` was stamped by the environment's server; shifting this client's
+  // clock by the arrival-time skew keeps the age honest when the two clocks
+  // disagree (a remote server hours behind must not render fresh rows amber).
+  const serverNowMs = nowMs - clockSkewMs;
+  const ageMs = serverNowMs - Date.parse(snapshot.asOf);
   if (!Number.isFinite(ageMs)) return null;
   return (
     <span
@@ -102,7 +114,7 @@ function SnapshotAge({ snapshot, nowMs }: { snapshot: AccountLimitsSnapshot; now
         ageMs >= STALE_AFTER_MS ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground",
       )}
     >
-      {formatAgo(snapshot.asOf, nowMs)}
+      {formatAgo(snapshot.asOf, serverNowMs)}
     </span>
   );
 }
@@ -166,7 +178,7 @@ function AccountCaption({
       />
       {showAge ? (
         <span className="ml-auto shrink-0">
-          <SnapshotAge snapshot={row.snapshot} nowMs={nowMs} />
+          <SnapshotAge snapshot={row.snapshot} nowMs={nowMs} clockSkewMs={row.clockSkewMs} />
         </span>
       ) : null}
     </div>
@@ -235,7 +247,13 @@ export function AccountLimitsHoverCard() {
               <Mark className="size-3 shrink-0 self-center" />
               <span className="text-xs font-medium text-foreground">{label}</span>
               <span className="ml-auto">
-                {only !== undefined ? <SnapshotAge snapshot={only.snapshot} nowMs={nowMs} /> : null}
+                {only !== undefined ? (
+                  <SnapshotAge
+                    snapshot={only.snapshot}
+                    nowMs={nowMs}
+                    clockSkewMs={only.clockSkewMs}
+                  />
+                ) : null}
               </span>
             </div>
             {rows.length === 0 || (only !== undefined && only.snapshot.windows.length === 0) ? (
@@ -257,8 +275,15 @@ export function AccountLimitsHoverCard() {
                     emailClassName="font-sans text-[10px] leading-normal"
                   />
                 ) : null}
+                {/* Vendor reset stamps read against the same server-corrected
+                    clock the age caption uses - one coherent timeline. */}
                 {only.snapshot.windows.map((window) => (
-                  <HoverWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
+                  <HoverWindowRow
+                    key={window.id}
+                    window={window}
+                    color={color}
+                    nowMs={nowMs - only.clockSkewMs}
+                  />
                 ))}
               </>
             ) : (
@@ -274,7 +299,12 @@ export function AccountLimitsHoverCard() {
                     emailClassName="font-sans text-[10px] leading-normal"
                   />
                   {row.snapshot.windows.map((window) => (
-                    <HoverWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
+                    <HoverWindowRow
+                      key={window.id}
+                      window={window}
+                      color={color}
+                      nowMs={nowMs - row.clockSkewMs}
+                    />
                   ))}
                 </div>
               ))
@@ -343,7 +373,11 @@ export function AccountLimitsSection() {
                 <span className="text-sm font-medium text-foreground">{label}</span>
                 <span className="ml-auto">
                   {only !== undefined ? (
-                    <SnapshotAge snapshot={only.snapshot} nowMs={nowMs} />
+                    <SnapshotAge
+                      snapshot={only.snapshot}
+                      nowMs={nowMs}
+                      clockSkewMs={only.clockSkewMs}
+                    />
                   ) : null}
                 </span>
               </div>
@@ -367,7 +401,12 @@ export function AccountLimitsSection() {
                     />
                   ) : null}
                   {only.snapshot.windows.map((window) => (
-                    <SectionWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
+                    <SectionWindowRow
+                      key={window.id}
+                      window={window}
+                      color={color}
+                      nowMs={nowMs - only.clockSkewMs}
+                    />
                   ))}
                 </>
               ) : (
@@ -387,7 +426,7 @@ export function AccountLimitsSection() {
                         key={window.id}
                         window={window}
                         color={color}
-                        nowMs={nowMs}
+                        nowMs={nowMs - row.clockSkewMs}
                       />
                     ))}
                   </div>

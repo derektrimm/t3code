@@ -53,8 +53,11 @@ const decodeGrokAuthFile = Schema.decodeUnknownEffect(
  * analogue of Codex's `account/read` and Cursor's `agent about`. The CLI
  * offers no query surface for it, but it persists what it knows; the email
  * is the one field this read decodes, through the same per-instance
- * GROK_HOME the spawned CLI resolves. Any failure is an unknown, never an
- * error: identity is a nicety, not a probe outcome.
+ * GROK_HOME the spawned CLI resolves. The schema binds nothing but that
+ * field, so the store's token material never reaches a binding - the same
+ * identity-only contract as `telemetry/Identify.ts`'s reads of codex's
+ * auth.json and ~/.claude.json. Any failure is an unknown, never an error:
+ * identity is a nicety, not a probe outcome.
  */
 const readGrokAuthIdentity = (
   environment: NodeJS.ProcessEnv,

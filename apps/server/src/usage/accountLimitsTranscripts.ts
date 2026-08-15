@@ -133,7 +133,8 @@ export interface GrokLogCredits {
  */
 export type GrokLogRead =
   | { readonly _tag: "credits"; readonly credits: GrokLogCredits }
-  | { readonly _tag: "expired" }
+  | { readonly _tag: "expired"; readonly asOfMs: number }
+  | { readonly _tag: "superseded"; readonly asOfMs: number }
   | { readonly _tag: "none" };
 
 /**
@@ -197,15 +198,23 @@ export async function readLatestGrokCredits(logPath: string, nowMs: number): Pro
         // through to an older line would show the last paid percentage after
         // a seat goes unmetered, or old-shape numbers after xAI reshapes the
         // payload - a wrong reading dressed as a reading.
+        const timestamp = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : Number.NaN;
+        const asOfMs = Number.isFinite(timestamp) ? timestamp : stat.mtimeMs;
         const snapshot = grokSnapshotFromCreditsConfig(parsed.ctx);
-        if (!snapshot || snapshot.windows.length === 0) return { _tag: "none" };
+        // The newest record exists but offers no usable reading (an unmetered
+        // seat, or a reshaped payload): it SUPERSEDES older lines without
+        // replacing them. The caller must stop serving any cached reading at
+        // least this old - "none" is reserved for finding no record at all,
+        // so log rotation can never wipe a good cache.
+        if (!snapshot || snapshot.windows.length === 0) return { _tag: "superseded", asOfMs };
         const resetsAt = snapshot.windows[0]?.resetsAt;
         const periodEndMs = resetsAt == null ? Number.NaN : Date.parse(resetsAt);
-        if (Number.isFinite(periodEndMs) && periodEndMs < nowMs) return { _tag: "expired" };
-        const timestamp = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : Number.NaN;
+        // The expired arm still names WHEN the dead reading was written, so a
+        // caller can tell "this verdict is older than my cache" from "newer".
+        if (Number.isFinite(periodEndMs) && periodEndMs < nowMs) return { _tag: "expired", asOfMs };
         return {
           _tag: "credits",
-          credits: { snapshot, asOfMs: Number.isFinite(timestamp) ? timestamp : stat.mtimeMs },
+          credits: { snapshot, asOfMs },
         };
       }
     }

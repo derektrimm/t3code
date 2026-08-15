@@ -378,6 +378,18 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
       NodePath.join(grokHomeB, "logs", "unified.jsonl"),
       `${grokLine(44, "2026-01-01T00:00:00.000Z")}\n`,
     );
+    // A codex instance with no homePath, homed by its environment's
+    // CODEX_HOME - the spawned CLI writes there, so the seed must read there.
+    const codexEnvHome = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-envhome-"));
+    NodeFS.mkdirSync(NodePath.join(codexEnvHome, "sessions"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(codexEnvHome, "sessions", "rollout-1.jsonl"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw transcript line.
+      `${JSON.stringify({
+        timestamp: "2026-08-15T10:00:00.000Z",
+        payload: { rate_limits: codexPayload(29) },
+      })}\n`,
+    );
     try {
       const summary = yield* Effect.gen(function* () {
         const service = yield* AccountLimitsService;
@@ -392,6 +404,10 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
               [asInstanceId("codex")]: {
                 driver: asDriver("codex"),
                 config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("codex_env")]: {
+                driver: asDriver("codex"),
+                environment: [{ name: "CODEX_HOME", value: codexEnvHome, sensitive: false }],
               },
               [asInstanceId("codex_sole")]: {
                 driver: asDriver("codex"),
@@ -434,11 +450,12 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
           snapshot.windows[0]?.usedPercent,
         ]),
       ).toEqual([
+        ["codex", "codex_env", "transcript", 29],
         ["codex", "codex_sole", "transcript", 37],
         ["grok", "grok", "transcript", 58],
       ]);
     } finally {
-      for (const dir of [soleDir, sharedDir, disabledDir, grokHomeA, grokHomeB]) {
+      for (const dir of [soleDir, sharedDir, disabledDir, grokHomeA, grokHomeB, codexEnvHome]) {
         NodeFS.rmSync(dir, { recursive: true, force: true });
       }
     }
@@ -865,6 +882,426 @@ it("uses a materialized sensitive GROK_HOME and lets an empty one contest the de
       NodeFS.rmSync(secretHome, { recursive: true, force: true });
       NodeFS.rmSync(ambientHome, { recursive: true, force: true });
     }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("a newer unmetered line evicts the cached paid reading it supersedes", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-grok-superseded-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // The newest record parses but carries no percent window: the seat went
+    // unmetered. The cached paid reading it supersedes must not keep serving.
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+    const unmeteredLine = JSON.stringify({
+      ts: "2026-01-02T00:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: {} },
+    });
+    NodeFS.writeFileSync(NodePath.join(home, "logs", "unified.jsonl"), `${unmeteredLine}\n`);
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-superseded-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(baseDir, "userdata", "account-limits.json"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "grok",
+          instanceId: "grok",
+          plan: "SuperGrok Heavy",
+          windows: [
+            {
+              id: "seven_day",
+              label: "Week",
+              usedPercent: 63,
+              resetsAt: "2099-01-01T00:00:00.000Z",
+              windowMinutes: 10080,
+            },
+          ],
+          asOf: "2026-01-01T10:00:00.000Z",
+          source: "transcript",
+        },
+      ]),
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayerAt(baseDir, {
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(summary.snapshots).toEqual([]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("a log with no billing record keeps the cache - rotation must not wipe rows", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-grok-rotated-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // A freshly rotated log: chatter only, no billing record anywhere.
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates raw log lines.
+    const chatter = JSON.stringify({ ts: "2026-01-02T00:00:00.000Z", msg: "session: started" });
+    NodeFS.writeFileSync(NodePath.join(home, "logs", "unified.jsonl"), `${chatter}\n${chatter}\n`);
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-rotated-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(baseDir, "userdata", "account-limits.json"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "grok",
+          instanceId: "grok",
+          plan: "SuperGrok Heavy",
+          windows: [
+            {
+              id: "seven_day",
+              label: "Week",
+              usedPercent: 63,
+              resetsAt: "2099-01-01T00:00:00.000Z",
+              windowMinutes: 10080,
+            },
+          ],
+          asOf: "2026-01-01T10:00:00.000Z",
+          source: "transcript",
+        },
+      ]),
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayerAt(baseDir, {
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(
+        summary.snapshots.map((snapshot) => [snapshot.provider, snapshot.windows[0]?.usedPercent]),
+      ).toEqual([["grok", 63]]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("a streamed traffic-less window cannot resurface what full snapshots suppress", () =>
+  Effect.gen(function* () {
+    const summary = yield* Effect.gen(function* () {
+      const service = yield* AccountLimitsService;
+      yield* service.ingest({
+        provider: asDriver("claudeAgent"),
+        payload: claudeUsagePayload(11, 7),
+        createdAt: "2026-08-15T10:00:00.000Z",
+        providerInstanceId: asInstanceId("claude_main"),
+      });
+      // The vendor now reports five_hour as untouched: 0% and no reset
+      // clock. The patch must apply the same traffic filter full snapshots
+      // do - not park a permanent bare 0% row on the card.
+      yield* service.ingest({
+        provider: asDriver("claudeAgent"),
+        payload: {
+          type: "rate_limit_event",
+          rate_limit_info: { status: "allowed", rateLimitType: "five_hour", utilization: 0 },
+        },
+        createdAt: "2026-08-15T10:05:00.000Z",
+        providerInstanceId: asInstanceId("claude_main"),
+      });
+      return yield* service.readSummary();
+    }).pipe(
+      Effect.provide(
+        makeLayer({
+          providerInstances: {
+            [asInstanceId("codex")]: {
+              driver: asDriver("codex"),
+              config: { homePath: "/nonexistent/t3-test-codex-default" },
+            },
+            [asInstanceId("grok")]: { driver: asDriver("grok"), enabled: false },
+            [asInstanceId("claude_main")]: { driver: asDriver("claudeAgent") },
+          },
+        }),
+      ),
+    );
+    const claudeRow = summary.snapshots.find((snapshot) => snapshot.provider === "claude");
+    expect(claudeRow?.windows.map((window) => [window.id, window.usedPercent])).toEqual([
+      ["seven_day", 7],
+    ]);
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("a stale expired verdict does not delete a newer live reading", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-race-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // The log's newest line is an OLD expired reading; the cache already
+    // holds a newer live-period one (the refresh-boot race, replayed flat).
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+    const expiredLine = JSON.stringify({
+      ts: "2026-01-01T10:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 63,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-01-05T00:00:00.000Z" },
+        },
+      },
+    });
+    NodeFS.writeFileSync(NodePath.join(home, "logs", "unified.jsonl"), `${expiredLine}\n`);
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-race-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(baseDir, "userdata", "account-limits.json"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "grok",
+          instanceId: "grok",
+          plan: "SuperGrok Heavy",
+          windows: [
+            {
+              id: "seven_day",
+              label: "Week",
+              usedPercent: 41,
+              resetsAt: "2099-01-01T00:00:00.000Z",
+              windowMinutes: 10080,
+            },
+          ],
+          asOf: "2026-01-02T00:00:00.000Z",
+          source: "transcript",
+        },
+      ]),
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayerAt(baseDir, {
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(
+        summary.snapshots.map((snapshot) => [snapshot.provider, snapshot.windows[0]?.usedPercent]),
+      ).toEqual([["grok", 41]]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("evicts a row whose instance now runs a different driver", () =>
+  Effect.gen(function* () {
+    const emptyHome = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-grok-empty-"));
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-flip-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    // A codex row cached while "personal" ran codex; the instance has since
+    // been reconfigured to grok, so the row's account no longer exists here.
+    NodeFS.writeFileSync(
+      NodePath.join(baseDir, "userdata", "account-limits.json"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "codex",
+          instanceId: "personal",
+          plan: "pro",
+          windows: [
+            {
+              id: "codex",
+              label: "Week",
+              usedPercent: 45,
+              resetsAt: "2099-01-01T00:00:00.000Z",
+              windowMinutes: 10080,
+            },
+          ],
+          asOf: "2026-08-15T10:00:00.000Z",
+          source: "live",
+        },
+      ]),
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayerAt(baseDir, {
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: { driver: asDriver("grok"), enabled: false },
+              [asInstanceId("personal")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: emptyHome, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(summary.snapshots).toEqual([]);
+    } finally {
+      NodeFS.rmSync(emptyHome, { recursive: true, force: true });
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("an unconfirmed migrated row keeps its v1 shape across restarts - the ghost eviction survives", () =>
+  Effect.gen(function* () {
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-restart-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    const cachePath = NodePath.join(baseDir, "userdata", "account-limits.json");
+    // A v1 cache: one claude row, no instanceId.
+    NodeFS.writeFileSync(
+      cachePath,
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "claude",
+          plan: "max",
+          windows: [
+            {
+              id: "five_hour",
+              label: "5h",
+              usedPercent: 12,
+              resetsAt: "2026-08-08T23:00:00.000Z",
+              windowMinutes: 300,
+            },
+          ],
+          asOf: "2026-08-01T00:00:00.000Z",
+          source: "live",
+        },
+      ]),
+    );
+    const roster = {
+      providerInstances: {
+        [asInstanceId("claudeAgent")]: { driver: asDriver("claudeAgent") },
+        [asInstanceId("claude_partner")]: { driver: asDriver("claudeAgent") },
+        [asInstanceId("codex")]: {
+          driver: asDriver("codex"),
+          config: { homePath: "/nonexistent/t3-test-codex-default" },
+        },
+        [asInstanceId("grok")]: { driver: asDriver("grok"), enabled: false },
+      },
+    };
+    try {
+      // First run: an UNRELATED codex ingest persists the cache. The migrated
+      // claude row must be written back in its v1 shape, still unconfirmed.
+      yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        yield* service.readSummary();
+        yield* service.ingest({
+          provider: asDriver("codex"),
+          payload: codexPayload(41),
+          createdAt: "2026-08-15T09:00:00.000Z",
+          providerInstanceId: asInstanceId("codex"),
+        });
+      }).pipe(Effect.provide(makeLayerAt(baseDir, roster)));
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - reads the raw cache file back.
+      const persisted = JSON.parse(NodeFS.readFileSync(cachePath, "utf8")) as {
+        provider: string;
+        instanceId?: string;
+      }[];
+      expect(
+        persisted.map((row) => [row.provider, "instanceId" in row ? row.instanceId : "(none)"]),
+      ).toEqual([
+        ["claude", "(none)"],
+        ["codex", "codex"],
+      ]);
+      // Second run - a restart. Live claude data on ANOTHER instance must
+      // still evict the migrated default row instead of leaving a ghost.
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        yield* service.ingest({
+          provider: asDriver("claudeAgent"),
+          payload: claudeUsagePayload(31, 9),
+          createdAt: "2026-08-15T10:00:00.000Z",
+          providerInstanceId: asInstanceId("claude_partner"),
+        });
+        return yield* service.readSummary();
+      }).pipe(Effect.provide(makeLayerAt(baseDir, roster)));
+      expect(summary.snapshots.map((snapshot) => [snapshot.provider, snapshot.instanceId])).toEqual(
+        [
+          ["claude", "claude_partner"],
+          ["codex", "codex"],
+        ],
+      );
+    } finally {
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("concurrent refreshes share one execution, stamped at completion", () =>
+  Effect.gen(function* () {
+    let claudePulls = 0;
+    const t0 = yield* Clock.currentTimeMillis;
+    const summaries = yield* Effect.gen(function* () {
+      const service = yield* AccountLimitsService;
+      return yield* Effect.all([service.refresh(), service.refresh()], { concurrency: 2 });
+    }).pipe(
+      Effect.provide(
+        accountLimitsLayerWith(
+          {
+            claude: () =>
+              Effect.gen(function* () {
+                claudePulls++;
+                // Long enough that a start-time stamp is measurably wrong.
+                yield* Effect.sleep(150);
+                return claudeUsagePayload(11, 7);
+              }),
+            codex: () => Effect.succeed(null),
+          },
+          {
+            providerInstances: {
+              [asInstanceId("claudeAgent")]: { driver: asDriver("claudeAgent"), enabled: false },
+              [asInstanceId("codex")]: { driver: asDriver("codex"), enabled: false },
+              [asInstanceId("grok")]: { driver: asDriver("grok"), enabled: false },
+              [asInstanceId("claude_main")]: { driver: asDriver("claudeAgent") },
+            },
+          },
+        ),
+      ),
+    );
+    // Two simultaneous clicks, one pull - and both callers got the result.
+    expect(claudePulls).toBe(1);
+    expect(summaries).toHaveLength(2);
+    const row = summaries[0]?.snapshots.find((snapshot) => snapshot.provider === "claude");
+    // Completion-stamped: at least the pull's own duration after the start.
+    expect(Date.parse(row?.asOf ?? "")).toBeGreaterThanOrEqual(t0 + 100);
   }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
 
 describe("planLimitsSeeds", () => {

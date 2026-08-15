@@ -31,11 +31,81 @@ const status = (
   environmentLabel: environmentId,
   isPending: false,
   snapshots: [],
+  readAt: null,
+  receivedAtMs: null,
   providers: null,
   ...overrides,
 });
 
 describe("mergeEnvironmentLimits", () => {
+  it("rows differing only in content are not duplicates - the stamp alone must not collapse them", () => {
+    const window = (usedPercent: number) => ({
+      id: "seven_day",
+      label: "Week",
+      usedPercent,
+      resetsAt: null,
+      windowMinutes: 10080,
+    });
+    const merged = mergeEnvironmentLimits([
+      status("desktop", {
+        snapshots: [snapshot("codex", { windows: [window(10)] as never })],
+      }),
+      status("laptop", {
+        snapshots: [snapshot("codex", { windows: [window(90)] as never })],
+      }),
+    ]);
+    expect(merged.get("codex")?.map((row) => row.snapshot.windows[0]?.usedPercent)).toEqual([
+      10, 90,
+    ]);
+  });
+
+  it("a display name shared by two different instances falls back to instance ids", () => {
+    const merged = mergeEnvironmentLimits([
+      status("laptop", {
+        snapshots: [
+          snapshot("codex", { instanceId: "codex_a" as never }),
+          snapshot("codex", { instanceId: "codex_b" as never }),
+        ],
+        providers: [
+          provider("codex_a", { displayName: "Codex" }),
+          provider("codex_b", { displayName: "Codex" }),
+        ] as never,
+      }),
+    ]);
+    expect(merged.get("codex")?.map((row) => row.instanceLabel)).toEqual(["codex_a", "codex_b"]);
+  });
+
+  it("one instance seen from two environments keeps its shared display name", () => {
+    const rows = mergeEnvironmentLimits([
+      status("desktop", {
+        snapshots: [snapshot("codex", { instanceId: "codex_a" as never })],
+        providers: [provider("codex_a", { displayName: "Work" })] as never,
+      }),
+      status("laptop", {
+        snapshots: [
+          snapshot("codex", { instanceId: "codex_a" as never, asOf: "2026-08-15T13:00:00.000Z" }),
+        ],
+        providers: [provider("codex_a", { displayName: "Work" })] as never,
+      }),
+    ]).get("codex");
+    expect(rows?.map((row) => row.instanceLabel)).toEqual(["Work", "Work"]);
+  });
+
+  it("carries the client-minus-server clock skew estimated at arrival", () => {
+    const merged = mergeEnvironmentLimits([
+      status("remote", {
+        snapshots: [snapshot("codex")],
+        readAt: "2026-08-15T12:00:10.000Z",
+        receivedAtMs: Date.parse("2026-08-15T12:00:00.000Z"),
+      }),
+      status("local", { snapshots: [snapshot("claude")] }),
+    ]);
+    // The remote server's clock runs ten seconds ahead of this client.
+    expect(merged.get("codex")?.[0]?.clockSkewMs).toBe(-10_000);
+    // No readAt (older server): no correction, never NaN.
+    expect(merged.get("claude")?.[0]?.clockSkewMs).toBe(0);
+  });
+
   it("keeps one row per instance instead of collapsing a provider to one slot", () => {
     const merged = mergeEnvironmentLimits([
       status("laptop", {
