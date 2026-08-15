@@ -716,6 +716,14 @@ export function createServerEnvironmentAtoms<R, E>(
     }),
     // Limits only move while sessions run, so a minute of staleness is fine
     // and keeps the hover card instant after its first open.
+    refreshAccountLimits: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:refresh-account-limits",
+      tag: WS_METHODS.serverRefreshAccountLimits,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
     accountLimits: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:account-limits",
       tag: WS_METHODS.serverGetAccountLimits,

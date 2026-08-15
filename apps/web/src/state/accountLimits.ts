@@ -24,6 +24,8 @@ import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 import { useCallback, useMemo } from "react";
 
+import { useAtomCommand } from "./use-atom-command";
+
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentPresentations } from "./presentation";
 import { serverEnvironment } from "./server";
@@ -161,7 +163,12 @@ export interface AccountLimitsView {
    * the first environment to answer must not decide that for the rest.
    */
   readonly isSettling: boolean;
-  readonly refresh: () => void;
+  /**
+   * Pull fresh limits from every provider with a query surface, on every
+   * environment, then re-read - the panel's refresh button. Resolves when
+   * the pulls have landed, so callers can hold a spinner honestly.
+   */
+  readonly refresh: () => Promise<void>;
 }
 
 export function useAccountLimits(): AccountLimitsView {
@@ -169,13 +176,24 @@ export function useAccountLimits(): AccountLimitsView {
 
   const byProvider = useMemo(() => mergeEnvironmentLimits(environments), [environments]);
 
-  const refresh = useCallback(() => {
+  const runRefresh = useAtomCommand(serverEnvironment.refreshAccountLimits, {
+    reportFailure: false,
+  });
+  const refresh = useCallback(async () => {
+    // Ask every environment's server to pull NOW (SDK usage request, codex
+    // account/rateLimits/read, unthrottled vendor-file pass)...
+    await Promise.all(
+      environments.map((environment) =>
+        runRefresh({ environmentId: environment.environmentId, input: {} }),
+      ),
+    );
+    // ...then re-read the query atoms so the panel shows what landed.
     for (const environment of environments) {
       appAtomRegistry.refresh(
         serverEnvironment.accountLimits({ environmentId: environment.environmentId, input: {} }),
       );
     }
-  }, [environments]);
+  }, [environments, runRefresh]);
 
   const answered = environments.filter((environment) => environment.snapshots !== null).length;
   const stillReporting = environments.filter(

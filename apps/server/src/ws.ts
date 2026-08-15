@@ -1541,6 +1541,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.serverGetAccountLimits, accountLimits.readSummary(), {
             "rpc.aggregate": "server",
           }),
+        [WS_METHODS.serverRefreshAccountLimits]: (_input) =>
+          observeRpcEffect(WS_METHODS.serverRefreshAccountLimits, accountLimits.refresh(), {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverRetryResourceTelemetry]: (_input) =>
           observeRpcEffect(WS_METHODS.serverRetryResourceTelemetry, resourceTelemetry.retry, {
             "rpc.aggregate": "server",

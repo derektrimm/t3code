@@ -12,8 +12,8 @@
  * can never be mistaken for one another.
  *
  * Every percentage is labelled `used` inline - a bare number cannot say
- * whether it is used or remaining. Snapshot age only renders once the data
- * is actually stale; fresh data needs no caption.
+ * whether it is used or remaining. Every row states its snapshot age -
+ * a meter's trust is its freshness - warming in tone once it goes stale.
  *
  * @module AccountLimits
  */
@@ -50,7 +50,7 @@ const LIMITS_PROVIDERS: readonly {
   { kind: "grok", label: "Grok", color: "var(--muted-foreground)", Mark: GrokIcon },
 ];
 
-/** Age past which a snapshot stops being "current" and earns a caption. */
+/** Age past which a snapshot's caption shifts to the warning tone. */
 const STALE_AFTER_MS = 15 * 60_000;
 
 /**
@@ -86,12 +86,24 @@ function LimitMeter({ window, color }: { window: AccountLimitsWindow; color: str
   );
 }
 
-/** `6h ago`, and only once the snapshot is old enough to matter. */
+/**
+ * Every row states its age: a meter's trust IS its freshness, and "no
+ * caption" made a two-minute-old reading and a fourteen-minute-old one
+ * indistinguishable. Past the staleness threshold the tone warms so an
+ * aging snapshot is visible before it is a problem.
+ */
 function SnapshotAge({ snapshot, nowMs }: { snapshot: AccountLimitsSnapshot; nowMs: number }) {
   const ageMs = nowMs - Date.parse(snapshot.asOf);
-  if (!Number.isFinite(ageMs) || ageMs < STALE_AFTER_MS) return null;
+  if (!Number.isFinite(ageMs)) return null;
   return (
-    <span className="text-[10px] text-muted-foreground">{formatAgo(snapshot.asOf, nowMs)}</span>
+    <span
+      className={cn(
+        "text-[10px] tabular-nums",
+        ageMs >= STALE_AFTER_MS ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground",
+      )}
+    >
+      {formatAgo(snapshot.asOf, nowMs)}
+    </span>
   );
 }
 

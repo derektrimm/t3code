@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { ProviderDriverKind, ProviderInstanceId, type ServerSettings } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -17,6 +18,7 @@ import {
   AccountLimitsService,
   type LimitsSeedTarget,
   layer as accountLimitsLayer,
+  make as makeService,
   planLimitsSeeds,
 } from "./AccountLimitsService.ts";
 
@@ -79,6 +81,21 @@ const instanceRoster = (): Partial<ServerSettings> => ({
 
 const makeLayer = (overrides: Partial<ServerSettings> = instanceRoster()) =>
   accountLimitsLayer.pipe(
+    Layer.provideMerge(ServerSettingsModule.layerTest(overrides)),
+    Layer.provideMerge(
+      Layer.fresh(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3code-account-limits-test-",
+        }),
+      ),
+    ),
+  );
+
+const accountLimitsLayerWith = (
+  pullers: Parameters<typeof makeService>[0],
+  overrides: Partial<ServerSettings>,
+) =>
+  Layer.effect(AccountLimitsService, makeService(pullers)).pipe(
     Layer.provideMerge(ServerSettingsModule.layerTest(overrides)),
     Layer.provideMerge(
       Layer.fresh(
@@ -338,7 +355,6 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
     // Grok: the CLI's own log line, one per home. The second home's period
     // has already ended - an expired window's percentage is not a reading.
     const grokLine = (percent: number, end: string) =>
-      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
       JSON.stringify({
         ts: "2026-08-15T10:00:00.000Z",
         msg: "billing: fetched credits config",
@@ -484,6 +500,129 @@ it("finds a grok billing line buried megabytes behind chattier logging", () =>
       ).toEqual([["grok", 63]]);
     } finally {
       NodeFS.rmSync(home, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("refresh pulls every enabled claude and codex instance and ingests per instance", () =>
+  Effect.gen(function* () {
+    const pulled: string[] = [];
+    const summary = yield* Effect.gen(function* () {
+      const service = yield* AccountLimitsService;
+      return yield* service.refresh();
+    }).pipe(
+      Effect.provide(
+        accountLimitsLayerWith(
+          {
+            claude: (settings, environment) =>
+              Effect.sync(() => {
+                pulled.push(`claude:${environment["MARKER"] ?? "none"}`);
+                return claudeUsagePayload(11, 7);
+              }),
+            codex: (_settings, environment) =>
+              Effect.sync(() => {
+                pulled.push(`codex:${environment["MARKER"] ?? "none"}`);
+                return codexPayload(41);
+              }),
+          },
+          {
+            providerInstances: {
+              // The registry synthesizes default instances from the legacy
+              // settings mirror; disabling them keeps this roster exact.
+              [asInstanceId("claudeAgent")]: { driver: asDriver("claudeAgent"), enabled: false },
+              [asInstanceId("codex")]: { driver: asDriver("codex"), enabled: false },
+              [asInstanceId("grok")]: { driver: asDriver("grok"), enabled: false },
+              [asInstanceId("claude_main")]: {
+                driver: asDriver("claudeAgent"),
+                environment: [{ name: "MARKER", value: "main", sensitive: false }],
+              },
+              [asInstanceId("claude_off")]: {
+                driver: asDriver("claudeAgent"),
+                enabled: false,
+              },
+              [asInstanceId("codex_a")]: {
+                driver: asDriver("codex"),
+                environment: [{ name: "MARKER", value: "a", sensitive: false }],
+                config: { homePath: "/nonexistent/t3-test-codex-a" },
+              },
+            },
+          },
+        ),
+      ),
+    );
+    // Disabled instances are never pulled; each pull ingests under its own
+    // instance id with the refresh moment as asOf.
+    expect(pulled.sort()).toEqual(["claude:main", "codex:a"]);
+    expect(
+      summary.snapshots.map((snapshot) => [
+        snapshot.provider,
+        snapshot.instanceId,
+        snapshot.source,
+        snapshot.windows[0]?.usedPercent,
+      ]),
+    ).toEqual([
+      ["claude", "claude_main", "live", 11],
+      ["codex", "codex_a", "live", 41],
+    ]);
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("refresh boots the grok TUI so the log gains a fresh line - and grok reads just-now too", () =>
+  Effect.gen(function* () {
+    const startedAtMs = yield* Clock.currentTimeMillis;
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-grok-boot-"));
+    const home = NodePath.join(dir, "grok-home");
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // A fake grok TUI: booting it writes a current billing line, exactly
+    // like the real one's billing extension does at startup.
+    const fakeGrok = NodePath.join(dir, "grok");
+    NodeFS.writeFileSync(
+      fakeGrok,
+      [
+        "#!/bin/sh",
+        "ts=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+        `printf '{"ts":"'"$ts"'","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":52,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"'"$(date -u -d @$(($(date +%s) + 86400)) +%Y-%m-%dT%H:%M:%S.000Z)"'"}},"subscriptionTier":"SuperGrok Heavy"}}\n' >> "$GROK_HOME/logs/unified.jsonl"`,
+        "sleep 30",
+        "",
+      ].join("\n"),
+    );
+    NodeFS.chmodSync(fakeGrok, 0o755);
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        const first = yield* service.refresh();
+        // A second click inside the freshness window must not boot again.
+        yield* service.refresh();
+        return first;
+      }).pipe(
+        Effect.provide(
+          accountLimitsLayerWith(
+            {
+              claude: () => Effect.succeed(null),
+              codex: () => Effect.succeed(null),
+            },
+            {
+              providerInstances: {
+                [asInstanceId("claudeAgent")]: { driver: asDriver("claudeAgent"), enabled: false },
+                [asInstanceId("codex")]: { driver: asDriver("codex"), enabled: false },
+                [asInstanceId("grok")]: {
+                  driver: asDriver("grok"),
+                  config: { binaryPath: fakeGrok },
+                  environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+                },
+              },
+            },
+          ),
+        ),
+      );
+      const grokRow = summary.snapshots.find((snapshot) => snapshot.provider === "grok");
+      expect(grokRow?.windows[0]?.usedPercent).toBe(52);
+      // The reading was fetched by the boot, not replayed from an old line.
+      expect(Date.parse(grokRow?.asOf ?? "")).toBeGreaterThanOrEqual(startedAtMs - 1000);
+      const logLines = NodeFS.readFileSync(NodePath.join(home, "logs", "unified.jsonl"), "utf8")
+        .trim()
+        .split("\n");
+      expect(logLines).toHaveLength(1);
+    } finally {
+      NodeFS.rmSync(dir, { recursive: true, force: true });
     }
   }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
 
@@ -666,7 +805,6 @@ it("uses a materialized sensitive GROK_HOME and lets an empty one contest the de
       NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
       NodeFS.writeFileSync(
         NodePath.join(home, "logs", "unified.jsonl"),
-        // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
         `${JSON.stringify({
           ts: "2026-08-15T10:00:00.000Z",
           msg: "billing: fetched credits config",

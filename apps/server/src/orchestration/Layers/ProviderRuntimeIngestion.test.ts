@@ -343,6 +343,12 @@ describe("ProviderRuntimeIngestion", () => {
           Effect.sync(() => {
             ingested.push(input);
           }),
+        refresh: () =>
+          Effect.succeed({
+            contractVersion: ACCOUNT_LIMITS_CONTRACT_VERSION,
+            readAt: "1970-01-01T00:00:00.000Z",
+            snapshots: [],
+          }),
       }),
     );
     const harness = await createHarness({ accountLimitsLayer: recordingLayer });

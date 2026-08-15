@@ -248,6 +248,7 @@ export const WS_METHODS = {
   serverGetBackgroundPolicy: "server.getBackgroundPolicy",
   serverGetUsageSummary: "server.getUsageSummary",
   serverGetAccountLimits: "server.getAccountLimits",
+  serverRefreshAccountLimits: "server.refreshAccountLimits",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -392,6 +393,12 @@ export const WsServerGetUsageSummaryRpc = Rpc.make(WS_METHODS.serverGetUsageSumm
 });
 
 export const WsServerGetAccountLimitsRpc = Rpc.make(WS_METHODS.serverGetAccountLimits, {
+  payload: Schema.Struct({}),
+  success: AccountLimitsSummary,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsServerRefreshAccountLimitsRpc = Rpc.make(WS_METHODS.serverRefreshAccountLimits, {
   payload: Schema.Struct({}),
   success: AccountLimitsSummary,
   error: EnvironmentAuthorizationError,
@@ -837,6 +844,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRetryResourceTelemetryRpc,
   WsServerGetUsageSummaryRpc,
   WsServerGetAccountLimitsRpc,
+  WsServerRefreshAccountLimitsRpc,
   WsServerSignalProcessRpc,
   WsServerReportClientActivityRpc,
   WsServerReportHostPowerStateRpc,
