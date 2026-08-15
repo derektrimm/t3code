@@ -19,7 +19,6 @@ import * as Schema from "effect/Schema";
 
 import { TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
-import { UsageProviderKind } from "./usage.ts";
 
 /**
  * Bumped whenever the shape of {@link AccountLimitsSummary} changes
@@ -34,6 +33,16 @@ import { UsageProviderKind } from "./usage.ts";
  */
 export const ACCOUNT_LIMITS_CONTRACT_VERSION = 2 as const;
 export const ACCOUNT_LIMITS_ACCEPTED_VERSIONS: readonly number[] = [1, 2];
+
+/**
+ * Providers the limits cache can hold snapshots for. Deliberately its own
+ * union rather than `UsageProviderKind`: that one belongs to the transcript
+ * cost analytics, whose exhaustive presentation tables and parsers would all
+ * be dragged along whenever limits coverage grows. Grok has no cost parser -
+ * and needs none to report its subscription window.
+ */
+export const AccountLimitsProviderKind = Schema.Literals(["claude", "codex", "grok"]);
+export type AccountLimitsProviderKind = typeof AccountLimitsProviderKind.Type;
 
 export const AccountLimitsWindow = Schema.Struct({
   /**
@@ -59,7 +68,7 @@ export const AccountLimitsSource = Schema.Literals(["live", "transcript"]);
 export type AccountLimitsSource = typeof AccountLimitsSource.Type;
 
 export const AccountLimitsSnapshot = Schema.Struct({
-  provider: UsageProviderKind,
+  provider: AccountLimitsProviderKind,
   /**
    * Routing key of the provider instance these windows were observed on.
    * Instances are the closest account identity every rate-limit event

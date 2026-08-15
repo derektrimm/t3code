@@ -5,6 +5,7 @@ import {
   claudeUsageSnapshotFromUnknown,
   claudeWindowFromRateLimitEvent,
   codexSnapshotFromUnknown,
+  grokSnapshotFromCreditsConfig,
   isPrimaryCodexLimit,
   windowHasTraffic,
 } from "./accountLimitsNormalize.ts";
@@ -205,5 +206,54 @@ describe("windowHasTraffic", () => {
 
   it("shows a drained window whose reset clock is still running", () => {
     expect(windowHasTraffic(window(0, "2026-08-21T07:59:00.000Z"))).toBe(true);
+  });
+});
+
+describe("grokSnapshotFromCreditsConfig", () => {
+  it("maps the CLI-logged weekly subscription window", () => {
+    const snapshot = grokSnapshotFromCreditsConfig({
+      config: {
+        creditUsagePercent: 63,
+        currentPeriod: {
+          type: "USAGE_PERIOD_TYPE_WEEKLY",
+          start: "2026-08-10T01:03:29.059430+00:00",
+          end: "2026-08-17T01:03:29.059430+00:00",
+        },
+      },
+      subscriptionTier: "SuperGrok Heavy",
+    });
+    expect(snapshot?.plan).toBe("SuperGrok Heavy");
+    expect(snapshot?.windows).toEqual([
+      {
+        id: "seven_day",
+        label: "Week",
+        usedPercent: 63,
+        resetsAt: "2026-08-17T01:03:29.059430+00:00",
+        windowMinutes: 10080,
+      },
+    ]);
+  });
+
+  it("names a monthly period honestly instead of assuming weekly", () => {
+    const snapshot = grokSnapshotFromCreditsConfig({
+      config: {
+        creditUsagePercent: 12,
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", end: "2026-09-01T00:00:00Z" },
+      },
+    });
+    expect(snapshot?.windows.map((window) => [window.id, window.label])).toEqual([
+      ["monthly", "Month"],
+    ]);
+  });
+
+  it("yields no windows when the config carries no percentage - never a fabricated 0%", () => {
+    const snapshot = grokSnapshotFromCreditsConfig({
+      config: { onDemandCap: { val: 0 }, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" } },
+    });
+    expect(snapshot?.windows).toEqual([]);
+  });
+
+  it("rejects shapes without a config object", () => {
+    expect(grokSnapshotFromCreditsConfig({ subscriptionTier: "SuperGrok" })).toBeNull();
   });
 });

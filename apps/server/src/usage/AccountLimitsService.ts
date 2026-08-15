@@ -23,14 +23,15 @@
  */
 import {
   ACCOUNT_LIMITS_CONTRACT_VERSION,
+  type AccountLimitsProviderKind,
   AccountLimitsSnapshot,
   type AccountLimitsSummary,
   CodexSettings,
   defaultInstanceIdForDriver,
   ProviderDriverKind,
+  type ProviderInstanceConfig,
   type ProviderInstanceConfigMap,
   ProviderInstanceId,
-  type UsageProviderKind,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -44,6 +45,7 @@ import * as Semaphore from "effect/Semaphore";
 
 import { writeFileStringAtomically } from "../atomicWrite.ts";
 import { ServerConfig } from "../config.ts";
+import { expandHomePath } from "../pathExpansion.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { deriveProviderInstanceConfigMap } from "../provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -54,7 +56,7 @@ import {
   isPrimaryCodexLimit,
   sortWindows,
 } from "./accountLimitsNormalize.ts";
-import { readLatestCodexRateLimits } from "./accountLimitsTranscripts.ts";
+import { readLatestCodexRateLimits, readLatestGrokCredits } from "./accountLimitsTranscripts.ts";
 
 /** Failed or empty transcript scans are not retried more often than this. */
 const CODEX_SEED_MIN_INTERVAL_MS = 60_000;
@@ -105,7 +107,12 @@ export const layerTest = Layer.succeed(
   }),
 );
 
-function providerFromDriver(driver: string): UsageProviderKind | null {
+/**
+ * Drivers whose adapters emit `account.rate-limits.updated`. Grok is
+ * deliberately absent: its adapter speaks ACP, which carries no rate-limit
+ * events - grok snapshots enter exclusively through the log seed below.
+ */
+function providerFromDriver(driver: string): AccountLimitsProviderKind | null {
   if (driver === "claudeAgent") return "claude";
   if (driver === "codex") return "codex";
   return null;
@@ -117,9 +124,9 @@ function providerFromDriver(driver: string): UsageProviderKind | null {
  * itself as the instance id (see `defaultInstanceIdForDriver`), so this is
  * not a guess - it is what that data always meant.
  */
-function defaultInstanceIdForProvider(provider: UsageProviderKind): ProviderInstanceId {
+function defaultInstanceIdForProvider(provider: AccountLimitsProviderKind): ProviderInstanceId {
   return defaultInstanceIdForDriver(
-    ProviderDriverKind.make(provider === "claude" ? "claudeAgent" : "codex"),
+    ProviderDriverKind.make(provider === "claude" ? "claudeAgent" : provider),
   );
 }
 
@@ -127,17 +134,19 @@ function defaultInstanceIdForProvider(provider: UsageProviderKind): ProviderInst
  * Map key for one (provider, instance) slot. Structured, not interpolated:
  * no spelling of an instance id can collide with another slot's key.
  */
-function slotKey(provider: UsageProviderKind, instanceId: ProviderInstanceId): string {
+function slotKey(provider: AccountLimitsProviderKind, instanceId: ProviderInstanceId): string {
   return JSON.stringify([provider, instanceId]);
 }
 
-/** One codex instance's resolved transcript location. */
-export interface CodexSeedTarget {
+/** One instance's resolved on-disk source of vendor-written limit data. */
+export interface LimitsSeedTarget {
+  readonly provider: AccountLimitsProviderKind;
   readonly instanceId: ProviderInstanceId;
-  readonly sessionsDir: string;
+  /** Codex: the shared `sessions/` dir. Grok: the CLI's `logs/` dir. */
+  readonly sourceDir: string;
   /**
-   * Disabled instances still own their transcripts - their sessions share
-   * the dir whether or not the instance currently runs - so they count for
+   * Disabled instances still own their files - their sessions share the dir
+   * whether or not the instance currently runs - so they count for
    * ambiguity, and only enabled sole owners are actually seeded.
    */
   readonly enabled: boolean;
@@ -152,12 +161,10 @@ export interface CodexSeedTarget {
  * events still meter every instance; the transcripts just stop pretending
  * to know whose usage they hold. Pure and exported for tests.
  */
-export function planCodexTranscriptSeeds(
-  targets: readonly CodexSeedTarget[],
-): readonly CodexSeedTarget[] {
-  const byDir = new Map<string, readonly CodexSeedTarget[]>();
+export function planLimitsSeeds(targets: readonly LimitsSeedTarget[]): readonly LimitsSeedTarget[] {
+  const byDir = new Map<string, readonly LimitsSeedTarget[]>();
   for (const target of targets) {
-    byDir.set(target.sessionsDir, [...(byDir.get(target.sessionsDir) ?? []), target]);
+    byDir.set(target.sourceDir, [...(byDir.get(target.sourceDir) ?? []), target]);
   }
   return [...byDir.values()].flatMap((owners) => (owners.length === 1 ? owners : []));
 }
@@ -219,6 +226,14 @@ export const make = Effect.gen(function* () {
   // A cache we cannot write is a colder next start, not a failure. Only
   // called while holding `stateLock`, which is what serializes writes; the
   // temp-file + rename keeps a crashed write from tearing the file.
+  /**
+   * Compare filesystem identity, not spellings: a symlinked home and its
+   * target are one directory, and treating them as two would hand the same
+   * account-ambiguous files to both.
+   */
+  const canonicalDir = (dir: string) =>
+    fileSystem.realPath(dir).pipe(Effect.catchCause(() => Effect.succeed(dir)));
+
   const persist = Effect.fn("AccountLimitsService.persist")(function* () {
     yield* encodeLimitsCache([...snapshots.values()]).pipe(
       Effect.flatMap((serialized) =>
@@ -338,7 +353,39 @@ export const make = Effect.gen(function* () {
    * included; only sessions dirs owned by exactly one instance are read
    * (see `planCodexTranscriptSeeds`).
    */
-  const maybeSeedCodexFromTranscripts = Effect.fn("AccountLimitsService.seedCodex")(function* (
+  /**
+   * The default GROK_HOME, resolved the way the spawned CLI resolves it:
+   * the driver builds the child env starting from process.env, so an
+   * ambient GROK_HOME redirects the default instance's CLI - and this seed
+   * must read where that CLI actually writes, not ~/.grok unconditionally.
+   */
+  const defaultGrokHome = () => expandHomePath(process.env["GROK_HOME"]?.trim() || "~/.grok");
+
+  /**
+   * A grok instance's home. `getSettings` has already materialized sensitive
+   * environment values, so a present value is usable whether or not it is
+   * flagged redacted. An EMPTY value cannot name a home - the instance's CLI
+   * would fall back to the ambient default - so it contests the default dir
+   * rather than minting a unique fake one, which would falsely hand the
+   * default instance sole ownership of data these instances share.
+   */
+  const grokHomeFor = (entry: ProviderInstanceConfig): string => {
+    const override = entry.environment?.find((variable) => variable.name === "GROK_HOME");
+    const value = override?.value.trim() ?? "";
+    return value === "" ? defaultGrokHome() : expandHomePath(value);
+  };
+
+  /**
+   * Recovers snapshots from what the vendor CLIs already write to disk,
+   * covering both a cold cache and sessions driven outside T3 Code: Codex
+   * stores its rate-limit snapshot beside every token count in its session
+   * transcripts, and the Grok CLI logs its fetched subscription window
+   * (grok's adapter speaks ACP, which has no rate-limit events, so this is
+   * grok's only source). Instances are enumerated the way the registry
+   * derives them, so the legacy single-instance mirrors are included; only
+   * dirs owned by exactly one instance are read (see `planLimitsSeeds`).
+   */
+  const maybeSeedFromVendorFiles = Effect.fn("AccountLimitsService.seedVendorFiles")(function* (
     nowMs: number,
     configMap: ProviderInstanceConfigMap | null,
   ) {
@@ -346,46 +393,68 @@ export const make = Effect.gen(function* () {
     if (nowMs - lastCodexSeedAttemptAtMs < CODEX_SEED_MIN_INTERVAL_MS) return;
     lastCodexSeedAttemptAtMs = nowMs;
 
-    const targets: CodexSeedTarget[] = [];
+    const targets: LimitsSeedTarget[] = [];
     for (const [rawInstanceId, entry] of Object.entries(configMap)) {
-      if (entry.driver !== "codex") continue;
-      const codexSettings = yield* decodeCodexSettings(entry.config ?? {}).pipe(
-        Effect.catchCause(() => Effect.succeed(null)),
-      );
-      if (codexSettings === null) continue;
-      const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
-        Effect.provideService(Path.Path, path),
-      );
-      const sessionsDir = path.join(layout.sharedHomePath, "sessions");
-      // Compare filesystem identity, not spellings: a symlinked home and its
-      // target are one directory, and treating them as two would hand the
-      // same account-ambiguous transcripts to both.
-      const canonical = yield* fileSystem
-        .realPath(sessionsDir)
-        .pipe(Effect.catchCause(() => Effect.succeed(sessionsDir)));
-      targets.push({
-        instanceId: ProviderInstanceId.make(rawInstanceId),
-        sessionsDir: canonical,
-        enabled: entry.enabled !== false,
-      });
+      if (entry.driver === "codex") {
+        const codexSettings = yield* decodeCodexSettings(entry.config ?? {}).pipe(
+          Effect.catchCause(() => Effect.succeed(null)),
+        );
+        if (codexSettings === null) continue;
+        const layout = yield* resolveCodexHomeLayout(codexSettings).pipe(
+          Effect.provideService(Path.Path, path),
+        );
+        targets.push({
+          provider: "codex",
+          instanceId: ProviderInstanceId.make(rawInstanceId),
+          sourceDir: yield* canonicalDir(path.join(layout.sharedHomePath, "sessions")),
+          enabled: entry.enabled !== false,
+        });
+      } else if (entry.driver === "grok") {
+        targets.push({
+          provider: "grok",
+          instanceId: ProviderInstanceId.make(rawInstanceId),
+          sourceDir: yield* canonicalDir(path.join(grokHomeFor(entry), "logs")),
+          enabled: entry.enabled !== false,
+        });
+      }
     }
 
-    for (const target of planCodexTranscriptSeeds(targets)) {
+    for (const target of planLimitsSeeds(targets)) {
       if (!target.enabled) continue;
-      const found = yield* Effect.promise(() =>
-        readLatestCodexRateLimits(target.sessionsDir, nowMs),
-      );
+      let found;
+      if (target.provider === "grok") {
+        const read = yield* Effect.promise(() =>
+          readLatestGrokCredits(path.join(target.sourceDir, "unified.jsonl"), nowMs),
+        );
+        if (read._tag === "expired") {
+          // The newest billing record's period has ended: whatever the cache
+          // holds for this instance belongs to a window that no longer
+          // exists, and keeping it would show a dead percentage "resetting
+          // now" forever.
+          yield* stateLock.withPermits(1)(
+            Effect.gen(function* () {
+              if (snapshots.delete(slotKey("grok", target.instanceId))) yield* persist();
+            }),
+          );
+          continue;
+        }
+        if (read._tag === "none") continue;
+        found = read.credits;
+      } else {
+        found = yield* Effect.promise(() => readLatestCodexRateLimits(target.sourceDir, nowMs));
+      }
       if (found === null) continue;
+      if (found.snapshot.windows.length === 0) continue;
       const asOf = DateTime.formatIso(DateTime.makeUnsafe(found.asOfMs));
-      // The slow transcript reads happened outside the lock; only the
+      // The slow file reads happened outside the lock; only the
       // guard-and-store is serialized against live ingests.
       yield* stateLock.withPermits(1)(
         Effect.gen(function* () {
-          const existing = snapshots.get(slotKey("codex", target.instanceId));
+          const existing = snapshots.get(slotKey(target.provider, target.instanceId));
           // ISO-8601 strings order lexicographically.
           if (existing !== undefined && existing.asOf >= asOf) return;
           yield* store({
-            provider: "codex",
+            provider: target.provider,
             instanceId: target.instanceId,
             plan: found.snapshot.plan ?? existing?.plan ?? null,
             windows: found.snapshot.windows,
@@ -404,9 +473,7 @@ export const make = Effect.gen(function* () {
       Effect.catchCause(() => Effect.succeed(null)),
     );
     const configMap = settings === null ? null : deriveProviderInstanceConfigMap(settings);
-    yield* maybeSeedCodexFromTranscripts(nowMs, configMap).pipe(
-      Effect.catchCause(() => Effect.void),
-    );
+    yield* maybeSeedFromVendorFiles(nowMs, configMap).pipe(Effect.catchCause(() => Effect.void));
     // A deleted instance takes its rows with it - anything else leaves a
     // ghost account forcing the captioned multi-row UI forever. A merely
     // disabled instance keeps its cache (re-enabling restores it) but stays
@@ -422,6 +489,22 @@ export const make = Effect.gen(function* () {
             if (configMap[instanceId] === undefined) {
               snapshots.delete(key);
               migratedSlots.delete(key);
+              evicted = true;
+              continue;
+            }
+            // Grok readings die with their period (the seed rejects expired
+            // lines for the same reason); a cached row can outlive its window
+            // when the log rotates or its dir turns ambiguous, and serving it
+            // would show a dead percentage "resetting now" forever.
+            if (
+              snapshot.provider === "grok" &&
+              snapshot.windows.length > 0 &&
+              snapshot.windows.every((window) => {
+                const end = window.resetsAt === null ? Number.NaN : Date.parse(window.resetsAt);
+                return Number.isFinite(end) && end < nowMs;
+              })
+            ) {
+              snapshots.delete(key);
               evicted = true;
             }
           }

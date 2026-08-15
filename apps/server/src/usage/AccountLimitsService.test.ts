@@ -15,9 +15,9 @@ import * as ServerConfig from "../config.ts";
 import * as ServerSettingsModule from "../serverSettings.ts";
 import {
   AccountLimitsService,
-  type CodexSeedTarget,
+  type LimitsSeedTarget,
   layer as accountLimitsLayer,
-  planCodexTranscriptSeeds,
+  planLimitsSeeds,
 } from "./AccountLimitsService.ts";
 
 const asInstanceId = (value: string): ProviderInstanceId => ProviderInstanceId.make(value);
@@ -324,6 +324,8 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
     const soleDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-sole-"));
     const sharedDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-shared-"));
     const disabledDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-disabled-"));
+    const grokHomeA = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-a-"));
+    const grokHomeB = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-b-"));
     // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw transcript line.
     const line = JSON.stringify({
       timestamp: "2026-08-15T10:00:00.000Z",
@@ -333,6 +335,33 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
       NodeFS.mkdirSync(NodePath.join(dir, "sessions"), { recursive: true });
       NodeFS.writeFileSync(NodePath.join(dir, "sessions", "rollout-1.jsonl"), `${line}\n`);
     }
+    // Grok: the CLI's own log line, one per home. The second home's period
+    // has already ended - an expired window's percentage is not a reading.
+    const grokLine = (percent: number, end: string) =>
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+      JSON.stringify({
+        ts: "2026-08-15T10:00:00.000Z",
+        msg: "billing: fetched credits config",
+        ctx: {
+          config: {
+            creditUsagePercent: percent,
+            currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end },
+          },
+          subscriptionTier: "SuperGrok Heavy",
+        },
+      });
+    // @effect-diagnostics-next-line globalDateInEffect:off - a period end in the real clock's future; the reader under test consults the real clock.
+    const farEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    NodeFS.mkdirSync(NodePath.join(grokHomeA, "logs"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(grokHomeA, "logs", "unified.jsonl"),
+      `${grokLine(58, farEnd)}\n`,
+    );
+    NodeFS.mkdirSync(NodePath.join(grokHomeB, "logs"), { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(grokHomeB, "logs", "unified.jsonl"),
+      `${grokLine(44, "2026-01-01T00:00:00.000Z")}\n`,
+    );
     try {
       const summary = yield* Effect.gen(function* () {
         const service = yield* AccountLimitsService;
@@ -367,6 +396,321 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
                 enabled: false,
                 config: { homePath: disabledDir },
               },
+              // Grok homes come from the instance environment - GrokSettings
+              // has no homePath field.
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: grokHomeA, sensitive: false }],
+              },
+              [asInstanceId("grok_expired")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: grokHomeB, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(
+        summary.snapshots.map((snapshot) => [
+          snapshot.provider,
+          snapshot.instanceId,
+          snapshot.source,
+          snapshot.windows[0]?.usedPercent,
+        ]),
+      ).toEqual([
+        ["codex", "codex_sole", "transcript", 37],
+        ["grok", "grok", "transcript", 58],
+      ]);
+    } finally {
+      for (const dir of [soleDir, sharedDir, disabledDir, grokHomeA, grokHomeB]) {
+        NodeFS.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("finds a grok billing line buried megabytes behind chattier logging", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-deep-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // @effect-diagnostics-next-line globalDateInEffect:off - a period end in the real clock's future; the reader under test consults the real clock.
+    const farEnd = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates raw log lines.
+    const billing = JSON.stringify({
+      ts: "2026-08-15T10:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 63,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: farEnd },
+        },
+        subscriptionTier: "SuperGrok Heavy",
+      },
+    });
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates raw log lines.
+    const noise = JSON.stringify({
+      ts: "2026-08-15T11:00:00.000Z",
+      msg: "shell: something chatty",
+      ctx: { pad: "x".repeat(400) },
+    });
+    const logPath = NodePath.join(home, "logs", "unified.jsonl");
+    NodeFS.writeFileSync(
+      logPath,
+      `${billing}\n${Array.from({ length: 3000 }, () => noise).join("\n")}\n`,
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            providerInstances: {
+              // Pin the synthesized default codex instance away from the real
+              // ~/.codex - the seed runs under the live clock here.
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(
+        summary.snapshots.map((snapshot) => [snapshot.provider, snapshot.windows[0]?.usedPercent]),
+      ).toEqual([["grok", 63]]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("resolves the default grok home the way the spawned CLI does - ambient GROK_HOME wins", () =>
+  Effect.gen(function* () {
+    const ambient = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-ambient-"));
+    NodeFS.mkdirSync(NodePath.join(ambient, "logs"), { recursive: true });
+    // @effect-diagnostics-next-line globalDateInEffect:off - a period end in the real clock's future; the reader under test consults the real clock.
+    const end = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+    const line = JSON.stringify({
+      ts: "2026-08-15T10:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 41,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end },
+        },
+      },
+    });
+    NodeFS.writeFileSync(NodePath.join(ambient, "logs", "unified.jsonl"), `${line}\n`);
+    const previous = process.env["GROK_HOME"];
+    process.env["GROK_HOME"] = ambient;
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              // The default grok instance: no instance-level GROK_HOME. Its
+              // CLI inherits the ambient value, so the seed must read there.
+              [asInstanceId("grok")]: { driver: asDriver("grok") },
+            },
+          }),
+        ),
+      );
+      expect(
+        summary.snapshots.map((snapshot) => [snapshot.provider, snapshot.windows[0]?.usedPercent]),
+      ).toEqual([["grok", 41]]);
+    } finally {
+      if (previous === undefined) delete process.env["GROK_HOME"];
+      else process.env["GROK_HOME"] = previous;
+      NodeFS.rmSync(ambient, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("evicts a cached grok row once its period has ended instead of resurrecting it", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-stale-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+    const expiredLine = JSON.stringify({
+      ts: "2026-01-01T10:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 63,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-01-05T00:00:00.000Z" },
+        },
+      },
+    });
+    NodeFS.writeFileSync(NodePath.join(home, "logs", "unified.jsonl"), `${expiredLine}\n`);
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-limits-stale-"));
+    NodeFS.mkdirSync(NodePath.join(baseDir, "userdata"), { recursive: true });
+    // The persisted row a past seed wrote while the period was still live.
+    NodeFS.writeFileSync(
+      NodePath.join(baseDir, "userdata", "account-limits.json"),
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the raw cache file.
+      JSON.stringify([
+        {
+          provider: "grok",
+          instanceId: "grok",
+          plan: "SuperGrok Heavy",
+          windows: [
+            {
+              id: "seven_day",
+              label: "Week",
+              usedPercent: 63,
+              resetsAt: "2026-01-05T00:00:00.000Z",
+              windowMinutes: 10080,
+            },
+          ],
+          asOf: "2026-01-01T10:00:00.000Z",
+          source: "transcript",
+        },
+      ]),
+    );
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayerAt(baseDir, {
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(summary.snapshots).toEqual([]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+      NodeFS.rmSync(baseDir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("stops at the newest billing record - an unmetered seat must not show an older paid reading", () =>
+  Effect.gen(function* () {
+    const home = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-unmetered-"));
+    NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+    // @effect-diagnostics-next-line globalDateInEffect:off - a period end in the real clock's future; the reader under test consults the real clock.
+    const end = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates raw log lines.
+    const paid = JSON.stringify({
+      ts: "2026-08-15T09:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 63,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end },
+        },
+      },
+    });
+    // The newest record carries no percentage - the shape an unmetered seat
+    // (or a reshaped payload) produces.
+    // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates raw log lines.
+    const unmetered = JSON.stringify({
+      ts: "2026-08-15T10:00:00.000Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { onDemandCap: { val: 0 } } },
+    });
+    NodeFS.writeFileSync(NodePath.join(home, "logs", "unified.jsonl"), `${paid}\n${unmetered}\n`);
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              [asInstanceId("grok")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: home, sensitive: false }],
+              },
+            },
+          }),
+        ),
+      );
+      expect(summary.snapshots).toEqual([]);
+    } finally {
+      NodeFS.rmSync(home, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
+
+it("uses a materialized sensitive GROK_HOME and lets an empty one contest the default dir", () =>
+  Effect.gen(function* () {
+    const secretHome = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-secret-"));
+    const ambientHome = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-seed-grok-amb2-"));
+    // @effect-diagnostics-next-line globalDateInEffect:off - a period end in the real clock's future; the reader under test consults the real clock.
+    const end = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const write = (home: string, percent: number) => {
+      NodeFS.mkdirSync(NodePath.join(home, "logs"), { recursive: true });
+      NodeFS.writeFileSync(
+        NodePath.join(home, "logs", "unified.jsonl"),
+        // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates one raw log line.
+        `${JSON.stringify({
+          ts: "2026-08-15T10:00:00.000Z",
+          msg: "billing: fetched credits config",
+          ctx: {
+            config: {
+              creditUsagePercent: percent,
+              currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end },
+            },
+          },
+        })}\n`,
+      );
+    };
+    write(secretHome, 22);
+    write(ambientHome, 77);
+    const previous = process.env["GROK_HOME"];
+    process.env["GROK_HOME"] = ambientHome;
+    try {
+      const summary = yield* Effect.gen(function* () {
+        const service = yield* AccountLimitsService;
+        return yield* service.readSummary();
+      }).pipe(
+        Effect.provide(
+          makeLayer({
+            providerInstances: {
+              [asInstanceId("codex")]: {
+                driver: asDriver("codex"),
+                config: { homePath: "/nonexistent/t3-test-codex-default" },
+              },
+              // getSettings materializes sensitive values before this code
+              // runs, so a flagged-redacted value that is present is usable.
+              [asInstanceId("grok_secret")]: {
+                driver: asDriver("grok"),
+                environment: [
+                  { name: "GROK_HOME", value: secretHome, sensitive: true, valueRedacted: true },
+                ],
+              },
+              // An empty value falls back to the ambient default - and must
+              // therefore CONTEST the default dir, not vanish: otherwise the
+              // default instance would be handed sole ownership of shared data.
+              [asInstanceId("grok")]: { driver: asDriver("grok") },
+              [asInstanceId("grok_blank")]: {
+                driver: asDriver("grok"),
+                environment: [{ name: "GROK_HOME", value: "", sensitive: false }],
+              },
             },
           }),
         ),
@@ -374,26 +718,27 @@ it("transcript seeding attributes a sole-owner dir and skips shared or disabled 
       expect(
         summary.snapshots.map((snapshot) => [
           snapshot.instanceId,
-          snapshot.source,
           snapshot.windows[0]?.usedPercent,
         ]),
-      ).toEqual([["codex_sole", "transcript", 37]]);
+      ).toEqual([["grok_secret", 22]]);
     } finally {
-      for (const dir of [soleDir, sharedDir, disabledDir]) {
-        NodeFS.rmSync(dir, { recursive: true, force: true });
-      }
+      if (previous === undefined) delete process.env["GROK_HOME"];
+      else process.env["GROK_HOME"] = previous;
+      NodeFS.rmSync(secretHome, { recursive: true, force: true });
+      NodeFS.rmSync(ambientHome, { recursive: true, force: true });
     }
   }).pipe(Effect.provide(NodeServices.layer), Effect.runPromise));
 
-describe("planCodexTranscriptSeeds", () => {
-  const target = (instanceId: string, sessionsDir: string, enabled = true): CodexSeedTarget => ({
+describe("planLimitsSeeds", () => {
+  const target = (instanceId: string, sourceDir: string, enabled = true): LimitsSeedTarget => ({
+    provider: "codex",
     instanceId: asInstanceId(instanceId),
-    sessionsDir,
+    sourceDir,
     enabled,
   });
 
   it("keeps sole-owner sessions dirs and attributes them to their instance", () => {
-    expect(planCodexTranscriptSeeds([target("codex", "/home/user/.codex/sessions")])).toEqual([
+    expect(planLimitsSeeds([target("codex", "/home/user/.codex/sessions")])).toEqual([
       target("codex", "/home/user/.codex/sessions"),
     ]);
   });
@@ -402,7 +747,7 @@ describe("planCodexTranscriptSeeds", () => {
     // The reported setup: three instances share one homePath (shadow homes
     // symlink sessions/ back to it) - seeding any of them invents data.
     expect(
-      planCodexTranscriptSeeds([
+      planLimitsSeeds([
         target("codex_a", "/home/user/.codex/sessions"),
         target("codex_b", "/home/user/.codex/sessions"),
         target("codex_c", "/home/user/.codex/sessions"),
@@ -412,7 +757,7 @@ describe("planCodexTranscriptSeeds", () => {
 
   it("counts disabled instances as owners - their transcripts share the dir", () => {
     expect(
-      planCodexTranscriptSeeds([
+      planLimitsSeeds([
         target("codex_a", "/home/user/.codex/sessions"),
         target("codex_off", "/home/user/.codex/sessions", false),
       ]),
@@ -421,7 +766,7 @@ describe("planCodexTranscriptSeeds", () => {
 
   it("plans independent dirs independently", () => {
     expect(
-      planCodexTranscriptSeeds([
+      planLimitsSeeds([
         target("codex_a", "/home/user/.codex/sessions"),
         target("codex_b", "/home/user/.codex/sessions"),
         target("codex_work", "/home/user/.codex-work/sessions"),

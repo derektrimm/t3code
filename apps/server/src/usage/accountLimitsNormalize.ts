@@ -282,6 +282,42 @@ export function codexSnapshotFromUnknown(value: unknown): CodexRateLimitsSnapsho
   return { limitId, plan, windows: sortWindows(windows.filter(windowHasTraffic)) };
 }
 
+export interface GrokCreditsSnapshot {
+  readonly plan: string | null;
+  readonly windows: AccountLimitsWindow[];
+}
+
+/**
+ * Parses one `billing: fetched credits config` context the Grok CLI writes
+ * to its own log during normal use - the vendor's own record, no token or
+ * endpoint involved. `creditUsagePercent` is the subscription percentage the
+ * grok.com usage page shows; `currentPeriod.type` names the window, which is
+ * never assumed (xAI serves the same field for weekly and monthly seats). A
+ * config carrying no finite percentage - the shape an unmetered seat
+ * produces - yields no windows: an empty return is the honest answer, never
+ * a fabricated 0%.
+ */
+export function grokSnapshotFromCreditsConfig(value: unknown): GrokCreditsSnapshot | null {
+  if (!isRecord(value)) return null;
+  const config = isRecord(value.config) ? value.config : null;
+  if (config === null) return null;
+  const plan = readString(value.subscriptionTier) ?? readString(config.subscriptionTier) ?? null;
+
+  const percent = readNumber(config.creditUsagePercent);
+  if (percent === null || percent < 0) return { plan, windows: [] };
+  const period = isRecord(config.currentPeriod) ? config.currentPeriod : null;
+  const periodType = period === null ? null : readString(period.type);
+  const monthly = periodType !== null && /MONTH/i.test(periodType);
+  const window: AccountLimitsWindow = {
+    id: monthly ? "monthly" : "seven_day",
+    label: monthly ? "Month" : "Week",
+    usedPercent: clampPercent(percent),
+    resetsAt: period === null ? null : readString(period.end),
+    windowMinutes: monthly ? null : SEVEN_DAY_MINUTES,
+  };
+  return { plan, windows: sortWindows([window].filter(windowHasTraffic)) };
+}
+
 /**
  * Classifies a Codex window by its duration, not its slot: OpenAI currently
  * ships the weekly window in `primary` with `secondary` empty (the 5-hour

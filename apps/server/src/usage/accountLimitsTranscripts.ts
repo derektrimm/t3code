@@ -17,8 +17,10 @@ import * as NodeFSP from "node:fs/promises";
 
 import {
   codexSnapshotFromUnknown,
+  grokSnapshotFromCreditsConfig,
   isPrimaryCodexLimit,
   type CodexRateLimitsSnapshot,
+  type GrokCreditsSnapshot,
 } from "./accountLimitsNormalize.ts";
 import { listTranscriptFiles } from "./usageTranscriptReader.ts";
 
@@ -112,6 +114,104 @@ async function readTailRateLimits(
     return null;
   } catch {
     return null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+export interface GrokLogCredits {
+  readonly snapshot: GrokCreditsSnapshot;
+  readonly asOfMs: number;
+}
+
+/**
+ * Tri-state read: `credits` is a usable reading; `expired` means the newest
+ * billing record's period has already ended, which the caller must treat as
+ * "drop any cached reading" - not merely "no new data" - or a stale
+ * percentage resurrects from the persisted cache forever; `none` means the
+ * log holds no billing record at all (or the newest one is unusable).
+ */
+export type GrokLogRead =
+  | { readonly _tag: "credits"; readonly credits: GrokLogCredits }
+  | { readonly _tag: "expired" }
+  | { readonly _tag: "none" };
+
+/**
+ * The Grok CLI logs far more than billing between fetches - a busy session
+ * pushes the last `billing:` line megabytes from the end - so unlike the
+ * Codex tail read, this walks backward in bounded chunks. The cap keeps a
+ * pathological log from stalling the RPC path; a billing line older than
+ * the cap's reach is stale enough that skipping it is honest.
+ */
+const GROK_CHUNK_BYTES = 256 * 1024;
+const GROK_MAX_CHUNKS = 32;
+
+/**
+ * Newest usable `billing: fetched credits config` line in the Grok CLI's own
+ * log. The CLI fetches its subscription window during ordinary interactive
+ * use and logs the whole config - the same "the vendor already wrote it to
+ * disk" contract the Codex transcript seed relies on. A reading whose period
+ * has already ended is not a reading (the percentage belongs to a window
+ * that no longer exists), so scanning stops there.
+ */
+export async function readLatestGrokCredits(logPath: string, nowMs: number): Promise<GrokLogRead> {
+  let handle;
+  try {
+    handle = await NodeFSP.open(logPath, "r");
+  } catch {
+    return { _tag: "none" };
+  }
+  try {
+    const stat = await handle.stat();
+    // Carries the (possibly line-split) head of the previous chunk so a
+    // billing line straddling a boundary is seen whole on the next pass.
+    let carry = "";
+    for (let chunk = 0; chunk < GROK_MAX_CHUNKS; chunk++) {
+      const end = stat.size - chunk * GROK_CHUNK_BYTES;
+      if (end <= 0) break;
+      const start = Math.max(0, end - GROK_CHUNK_BYTES);
+      const { buffer, bytesRead } = await handle.read({
+        buffer: Buffer.alloc(end - start),
+        position: start,
+      });
+      const text = buffer.subarray(0, bytesRead).toString("utf8") + carry;
+      const lines = text.split("\n");
+      // The first element may be the tail of a line that starts in the next
+      // (earlier) chunk; hold it back unless this chunk reaches the file start.
+      carry = start === 0 ? "" : (lines.shift() ?? "");
+      for (let index = lines.length - 1; index >= 0; index--) {
+        const line = lines[index];
+        if (!line || !line.includes("billing: fetched credits config")) continue;
+        let parsed: unknown;
+        try {
+          // A parse failure here can only be a chunk-boundary artifact (the
+          // carry covers real splits) or corruption - keep scanning.
+          parsed = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        // The substring can occur inside another record's payload; only the
+        // actual msg field marks a billing record.
+        if (!isRecord(parsed) || parsed.msg !== "billing: fetched credits config") continue;
+        // This IS the newest billing record, and it alone decides. Falling
+        // through to an older line would show the last paid percentage after
+        // a seat goes unmetered, or old-shape numbers after xAI reshapes the
+        // payload - a wrong reading dressed as a reading.
+        const snapshot = grokSnapshotFromCreditsConfig(parsed.ctx);
+        if (!snapshot || snapshot.windows.length === 0) return { _tag: "none" };
+        const resetsAt = snapshot.windows[0]?.resetsAt;
+        const periodEndMs = resetsAt == null ? Number.NaN : Date.parse(resetsAt);
+        if (Number.isFinite(periodEndMs) && periodEndMs < nowMs) return { _tag: "expired" };
+        const timestamp = typeof parsed.ts === "string" ? Date.parse(parsed.ts) : Number.NaN;
+        return {
+          _tag: "credits",
+          credits: { snapshot, asOfMs: Number.isFinite(timestamp) ? timestamp : stat.mtimeMs },
+        };
+      }
+    }
+    return { _tag: "none" };
+  } catch {
+    return { _tag: "none" };
   } finally {
     await handle.close().catch(() => {});
   }
