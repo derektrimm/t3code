@@ -17,13 +17,38 @@
  *
  * @module AccountLimits
  */
-import type { AccountLimitsSnapshot, AccountLimitsWindow } from "@t3tools/contracts";
+import type {
+  AccountLimitsProviderKind,
+  AccountLimitsSnapshot,
+  AccountLimitsWindow,
+} from "@t3tools/contracts";
 import { useEffect, useState } from "react";
 
 import { cn } from "../../lib/utils";
 import { type AccountLimitsRow, useAccountLimits } from "../../state/accountLimits";
-import { formatAgo, formatResetAt } from "../../usage/limitsFormat";
-import { PROVIDER_COLOR, PROVIDER_LABEL, PROVIDER_MARK, PROVIDER_ORDER } from "./usageProviders";
+import { formatAgo, formatPlan, formatResetAt } from "../../usage/limitsFormat";
+import { ClaudeAI, GrokIcon, type Icon, OpenAI } from "../Icons";
+import { RedactedSensitiveText } from "../settings/RedactedSensitiveText";
+
+/**
+ * Presentation for the Limits panel - deliberately its own roster rather than
+ * `usageProviders`': limits cover providers (Grok) the transcript cost
+ * analytics does not, and the two lists must be free to grow apart. Claude
+ * and Codex reuse the exact colours and marks of the analytics page so the
+ * two surfaces keep reading as one system; Grok's mark is monochrome, so its
+ * bars take the muted foreground - distinct from Codex's full-strength
+ * neutral in both themes.
+ */
+const LIMITS_PROVIDERS: readonly {
+  readonly kind: AccountLimitsProviderKind;
+  readonly label: string;
+  readonly color: string;
+  readonly Mark: Icon;
+}[] = [
+  { kind: "codex", label: "Codex", color: "#e6e6e6", Mark: OpenAI },
+  { kind: "claude", label: "Claude Code", color: "#d97757", Mark: ClaudeAI },
+  { kind: "grok", label: "Grok", color: "var(--muted-foreground)", Mark: GrokIcon },
+];
 
 /** Age past which a snapshot stops being "current" and earns a caption. */
 const STALE_AFTER_MS = 15 * 60_000;
@@ -76,36 +101,69 @@ function rowKey(row: AccountLimitsRow): string {
   // so the key must use the same spelling or an instance literally named
   // "default" could collide with a legacy row.
   const instanceId =
-    row.snapshot.instanceId ?? (row.snapshot.provider === "claude" ? "claudeAgent" : "codex");
+    row.snapshot.instanceId ??
+    (row.snapshot.provider === "claude" ? "claudeAgent" : row.snapshot.provider);
   return `${row.environmentId}:${instanceId}`;
 }
 
 /**
- * "Work · laptop" - who a row group belongs to, shown only when a provider
- * has more than one group and the numbers could otherwise be conflated.
+ * Who a row group belongs to: instance name (when several rows could be
+ * conflated), plan, and the account email - the email through the same
+ * blur-until-clicked treatment the provider settings use, so the caption
+ * never leaks what that redaction protects.
  */
-function RowCaption({
+function AccountCaption({
   row,
+  showInstance,
   nameEnvironment,
+  showAge,
   nowMs,
   className,
+  emailClassName,
 }: {
   row: AccountLimitsRow;
+  showInstance: boolean;
   nameEnvironment: boolean;
+  showAge: boolean;
   nowMs: number;
   className: string;
+  emailClassName: string;
 }) {
+  const plan = formatPlan(row.snapshot.plan);
+  const parts: string[] = [];
+  if (showInstance) {
+    parts.push(
+      nameEnvironment && row.environmentLabel !== null
+        ? `${row.instanceLabel} · ${row.environmentLabel}`
+        : row.instanceLabel,
+    );
+  }
+  if (plan !== null) parts.push(plan);
+  if (parts.length === 0 && row.accountEmail === null) return null;
   return (
-    <div className={cn("flex items-baseline gap-1.5", className)}>
-      <span className="truncate">
-        {row.instanceLabel}
-        {nameEnvironment && row.environmentLabel !== null ? ` · ${row.environmentLabel}` : ""}
-      </span>
-      <span className="ml-auto shrink-0">
-        <SnapshotAge snapshot={row.snapshot} nowMs={nowMs} />
-      </span>
+    <div className={cn("flex min-w-0 items-baseline gap-1.5", className)}>
+      {parts.length > 0 ? <span className="truncate">{parts.join(" · ")}</span> : null}
+      {/* Matches the caption's type instead of the settings page's mono:
+          this line reads as one sentence, not a form field. */}
+      <RedactedSensitiveText
+        value={row.accountEmail}
+        ariaLabel="Account email"
+        revealTooltip="Click to reveal"
+        hideTooltip="Click to hide"
+        className={emailClassName}
+      />
+      {showAge ? (
+        <span className="ml-auto shrink-0">
+          <SnapshotAge snapshot={row.snapshot} nowMs={nowMs} />
+        </span>
+      ) : null}
     </div>
   );
+}
+
+/** True when a caption would carry any account information at all. */
+function hasAccountInfo(row: AccountLimitsRow): boolean {
+  return formatPlan(row.snapshot.plan) !== null || row.accountEmail !== null;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,17 +214,14 @@ export function AccountLimitsHoverCard() {
 
   return (
     <div className="flex w-64 flex-col gap-2.5 p-1.5">
-      {PROVIDER_ORDER.map((provider) => {
+      {LIMITS_PROVIDERS.map(({ kind: provider, label, color, Mark }) => {
         const rows = byProvider.get(provider) ?? [];
         const only = rows.length === 1 ? rows[0] : undefined;
-        const Mark = PROVIDER_MARK[provider];
         return (
           <div key={provider} className="flex flex-col gap-1">
             <div className="flex items-baseline gap-1.5">
               <Mark className="size-3 shrink-0 self-center" />
-              <span className="text-xs font-medium text-foreground">
-                {PROVIDER_LABEL[provider]}
-              </span>
+              <span className="text-xs font-medium text-foreground">{label}</span>
               <span className="ml-auto">
                 {only !== undefined ? <SnapshotAge snapshot={only.snapshot} nowMs={nowMs} /> : null}
               </span>
@@ -176,31 +231,38 @@ export function AccountLimitsHoverCard() {
                 {rows.length === 0 && isSettling ? "Loading…" : "No limit data yet"}
               </p>
             ) : only !== undefined ? (
-              // Single group - the common case: same markup as one account.
-              only.snapshot.windows.map((window) => (
-                <HoverWindowRow
-                  key={window.id}
-                  window={window}
-                  color={PROVIDER_COLOR[provider]}
-                  nowMs={nowMs}
-                />
-              ))
+              <>
+                {/* One account: name it (plan + blurred email) when known -
+                    an API-key setup with neither renders exactly as before. */}
+                {hasAccountInfo(only) ? (
+                  <AccountCaption
+                    row={only}
+                    showInstance={false}
+                    nameEnvironment={false}
+                    showAge={false}
+                    nowMs={nowMs}
+                    className="text-[10px] text-muted-foreground"
+                    emailClassName="font-sans text-[10px] leading-normal"
+                  />
+                ) : null}
+                {only.snapshot.windows.map((window) => (
+                  <HoverWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
+                ))}
+              </>
             ) : (
               rows.map((row) => (
                 <div key={rowKey(row)} className="flex flex-col gap-1">
-                  <RowCaption
+                  <AccountCaption
                     row={row}
+                    showInstance
                     nameEnvironment={reportingEnvironments > 1}
+                    showAge
                     nowMs={nowMs}
                     className="text-[10px] text-muted-foreground"
+                    emailClassName="font-sans text-[10px] leading-normal"
                   />
                   {row.snapshot.windows.map((window) => (
-                    <HoverWindowRow
-                      key={window.id}
-                      window={window}
-                      color={PROVIDER_COLOR[provider]}
-                      nowMs={nowMs}
-                    />
+                    <HoverWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
                   ))}
                 </div>
               ))
@@ -259,17 +321,14 @@ export function AccountLimitsSection() {
     <section className="flex flex-col gap-3">
       <h2 className="text-sm font-medium text-foreground">Limits</h2>
       <div className="grid gap-x-12 gap-y-4 sm:grid-cols-2">
-        {PROVIDER_ORDER.map((provider) => {
+        {LIMITS_PROVIDERS.map(({ kind: provider, label, color, Mark }) => {
           const rows = byProvider.get(provider) ?? [];
           const only = rows.length === 1 ? rows[0] : undefined;
-          const Mark = PROVIDER_MARK[provider];
           return (
             <div key={provider} className="flex flex-col gap-1.5">
               <div className="flex items-baseline gap-2">
                 <Mark className="size-3.5 shrink-0 self-center" />
-                <span className="text-sm font-medium text-foreground">
-                  {PROVIDER_LABEL[provider]}
-                </span>
+                <span className="text-sm font-medium text-foreground">{label}</span>
                 <span className="ml-auto">
                   {only !== undefined ? (
                     <SnapshotAge snapshot={only.snapshot} nowMs={nowMs} />
@@ -281,29 +340,41 @@ export function AccountLimitsSection() {
                   {rows.length === 0 && isSettling ? "Loading…" : "No limit data yet"}
                 </p>
               ) : only !== undefined ? (
-                // Single group - the common case: same markup as one account.
-                only.snapshot.windows.map((window) => (
-                  <SectionWindowRow
-                    key={window.id}
-                    window={window}
-                    color={PROVIDER_COLOR[provider]}
-                    nowMs={nowMs}
-                  />
-                ))
+                <>
+                  {/* One account: name it (plan + blurred email) when known -
+                      an API-key setup with neither renders exactly as before. */}
+                  {hasAccountInfo(only) ? (
+                    <AccountCaption
+                      row={only}
+                      showInstance={false}
+                      nameEnvironment={false}
+                      showAge={false}
+                      nowMs={nowMs}
+                      className="text-xs text-muted-foreground"
+                      emailClassName="font-sans text-xs leading-normal"
+                    />
+                  ) : null}
+                  {only.snapshot.windows.map((window) => (
+                    <SectionWindowRow key={window.id} window={window} color={color} nowMs={nowMs} />
+                  ))}
+                </>
               ) : (
                 rows.map((row) => (
                   <div key={rowKey(row)} className="flex flex-col gap-1.5">
-                    <RowCaption
+                    <AccountCaption
                       row={row}
+                      showInstance
                       nameEnvironment={reportingEnvironments > 1}
+                      showAge
                       nowMs={nowMs}
                       className="text-xs text-muted-foreground"
+                      emailClassName="font-sans text-xs leading-normal"
                     />
                     {row.snapshot.windows.map((window) => (
                       <SectionWindowRow
                         key={window.id}
                         window={window}
-                        color={PROVIDER_COLOR[provider]}
+                        color={color}
                         nowMs={nowMs}
                       />
                     ))}

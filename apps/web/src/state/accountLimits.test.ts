@@ -3,13 +3,13 @@ import type {
   AccountLimitsSnapshot,
   EnvironmentId,
   ServerProvider,
-  UsageProviderKind,
+  AccountLimitsProviderKind,
 } from "@t3tools/contracts";
 
 import { type EnvironmentLimitsStatus, mergeEnvironmentLimits } from "./accountLimits";
 
 const snapshot = (
-  provider: UsageProviderKind,
+  provider: AccountLimitsProviderKind,
   overrides: Partial<AccountLimitsSnapshot> = {},
 ): AccountLimitsSnapshot => ({
   provider,
@@ -110,10 +110,12 @@ describe("mergeEnvironmentLimits", () => {
         ],
       }),
     ]);
-    expect(merged.get("claude")?.map((row) => row.instanceLabel)).toEqual([
-      "Claude Main",
-      "claude_partner",
-      "claude_unknown",
+    expect(merged.get("claude")?.map((row) => [row.instanceLabel, row.accountEmail])).toEqual([
+      // The email rides the row only when the probe reports the instance as
+      // authenticated - rendering then blurs it like the settings UI does.
+      ["Claude Main", null],
+      ["claude_partner", "partner@example.com"],
+      ["claude_unknown", null],
     ]);
   });
 });

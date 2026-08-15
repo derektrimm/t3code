@@ -18,7 +18,7 @@ import {
   type AccountLimitsSnapshot,
   type EnvironmentId,
   type ServerProvider,
-  type UsageProviderKind,
+  type AccountLimitsProviderKind,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
@@ -63,6 +63,12 @@ export interface AccountLimitsRow {
   readonly environmentId: EnvironmentId;
   readonly environmentLabel: string | null;
   /**
+   * The authenticated account email for this instance, when the provider
+   * probe reports one - rendering shows it ONLY through the same
+   * blur-until-clicked treatment the provider settings use.
+   */
+  readonly accountEmail: string | null;
+  /**
    * Instance display name off the provider config already streaming to the
    * client, else the raw instance id. Never the account email: the provider
    * UI deliberately blurs emails until clicked, and a caption must not leak
@@ -74,8 +80,8 @@ export interface AccountLimitsRow {
 }
 
 /** What an unkeyed (pre-instance-attribution) snapshot always meant. */
-const legacyInstanceIdFor = (provider: UsageProviderKind): string =>
-  provider === "claude" ? "claudeAgent" : "codex";
+const legacyInstanceIdFor = (provider: AccountLimitsProviderKind): string =>
+  provider === "claude" ? "claudeAgent" : provider;
 
 /**
  * Pure merge, exported for tests: dedupe freshest-wins per instance WITHIN
@@ -84,8 +90,8 @@ const legacyInstanceIdFor = (provider: UsageProviderKind): string =>
  */
 export function mergeEnvironmentLimits(
   statuses: readonly EnvironmentLimitsStatus[],
-): ReadonlyMap<UsageProviderKind, readonly AccountLimitsRow[]> {
-  const byProvider = new Map<UsageProviderKind, AccountLimitsRow[]>();
+): ReadonlyMap<AccountLimitsProviderKind, readonly AccountLimitsRow[]> {
+  const byProvider = new Map<AccountLimitsProviderKind, AccountLimitsRow[]>();
   // Two environments on one machine (worktree servers) can hold identical
   // snapshots. Byte-identical rows carry no extra information, so exact
   // duplicates collapse; rows that differ at all - clocks included - stay,
@@ -116,9 +122,12 @@ export function mergeEnvironmentLimits(
       seen.add(duplicateKey);
       const provider = status.providers?.find((candidate) => candidate.instanceId === instanceId);
       const rows = byProvider.get(snapshot.provider) ?? [];
+      const authEmail =
+        provider?.auth.status === "authenticated" ? (provider.auth.email ?? null) : null;
       rows.push({
         environmentId: status.environmentId,
         environmentLabel: status.environmentLabel,
+        accountEmail: authEmail !== null && authEmail.trim() !== "" ? authEmail : null,
         instanceLabel: provider?.displayName ?? instanceId,
         snapshot,
       });
@@ -141,7 +150,7 @@ export interface AccountLimitsView {
    * instances (or several environments), each labeled; most setups have
    * exactly one.
    */
-  readonly byProvider: ReadonlyMap<UsageProviderKind, readonly AccountLimitsRow[]>;
+  readonly byProvider: ReadonlyMap<AccountLimitsProviderKind, readonly AccountLimitsRow[]>;
   /** Environments that have answered - >1 means rows need their environment named. */
   readonly reportingEnvironments: number;
   /** True until at least one environment has answered. */

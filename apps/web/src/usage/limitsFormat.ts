@@ -42,3 +42,30 @@ export function formatAgo(asOf: string, nowMs: number): string {
   if (hours < 48) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
 }
+
+/**
+ * Display casing for the terse plan slugs providers report ("max",
+ * "prolite"). A value that already carries display casing or spacing -
+ * grok's "SuperGrok Heavy" - passes through untouched; unknown slugs get a
+ * capital letter rather than a guess at their marketing name.
+ */
+const PLAN_LABELS: Record<string, string> = {
+  max: "Max",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  plus: "Plus",
+  go: "Go",
+  team: "Team",
+  business: "Business",
+  enterprise: "Enterprise",
+  edu: "Edu",
+  free: "Free",
+};
+
+export function formatPlan(plan: string | null): string | null {
+  if (plan === null) return null;
+  const trimmed = plan.trim();
+  if (trimmed === "") return null;
+  if (/[A-Z ]/.test(trimmed)) return trimmed;
+  return PLAN_LABELS[trimmed] ?? trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+}
