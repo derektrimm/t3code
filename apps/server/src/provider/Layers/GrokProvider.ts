@@ -3,10 +3,14 @@ import {
   type ModelCapabilities,
   type ServerProvider,
   type ServerProviderModel,
+  type ServerProviderAuth,
 } from "@t3tools/contracts";
 import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as Crypto from "effect/Crypto";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -29,7 +33,46 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
+import { expandHomePath } from "../../pathExpansion.ts";
 import { makeGrokAcpRuntime, resolveGrokAcpBaseModelId } from "../acp/GrokAcpSupport.ts";
+
+/**
+ * Only the identity field is decoded: token fields are structurally
+ * invisible to this schema and never leave the file.
+ */
+const GrokAuthFile = Schema.Record(
+  Schema.String,
+  Schema.Struct({ email: Schema.optional(Schema.String) }),
+);
+const decodeGrokAuthFile = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(GrokAuthFile as unknown as Schema.Codec<typeof GrokAuthFile.Type>),
+);
+
+/**
+ * The signed-in identity from the Grok CLI's own auth store - the grok
+ * analogue of Codex's `account/read` and Cursor's `agent about`. The CLI
+ * offers no query surface for it, but it persists what it knows; the email
+ * is the one field this read decodes, through the same per-instance
+ * GROK_HOME the spawned CLI resolves. Any failure is an unknown, never an
+ * error: identity is a nicety, not a probe outcome.
+ */
+const readGrokAuthIdentity = (
+  environment: NodeJS.ProcessEnv,
+): Effect.Effect<ServerProviderAuth, never, FileSystem.FileSystem | Path.Path> =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const home = expandHomePath(environment["GROK_HOME"]?.trim() || "~/.grok");
+    const raw = yield* fileSystem.readFileString(path.join(home, "auth.json"));
+    const entries = yield* decodeGrokAuthFile(raw);
+    for (const entry of Object.values(entries)) {
+      const email = entry.email?.trim();
+      if (email !== undefined && email !== "") {
+        return { status: "authenticated", email } satisfies ServerProviderAuth;
+      }
+    }
+    return { status: "unknown" } satisfies ServerProviderAuth;
+  }).pipe(Effect.catchCause(() => Effect.succeed({ status: "unknown" } as ServerProviderAuth)));
 
 const GROK_PRESENTATION = {
   displayName: "Grok",
@@ -164,10 +207,15 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
 ): Effect.fn.Return<
   ServerProviderDraft,
   never,
-  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
+  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto | FileSystem.FileSystem | Path.Path
 > {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = grokModelsFromSettings(grokSettings.customModels);
+
+  // Identity is independent of probe health: the CLI's auth store names the
+  // signed-in account whether or not the binary runs or ACP starts, exactly
+  // as the settings card separates auth from status.
+  const auth = yield* readGrokAuthIdentity(environment);
 
   if (!grokSettings.enabled) {
     return buildServerProvider({
@@ -179,7 +227,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: false,
         version: null,
         status: "warning",
-        auth: { status: "unknown" },
+        auth,
         message: "Grok is disabled in T3 Code settings.",
       },
     });
@@ -204,7 +252,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: !isCommandMissingCause(error),
         version: null,
         status: "error",
-        auth: { status: "unknown" },
+        auth,
         message: isCommandMissingCause(error)
           ? "Grok CLI (`grok`) is not installed or not on PATH."
           : "Failed to execute Grok CLI health check.",
@@ -222,7 +270,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: true,
         version: null,
         status: "error",
-        auth: { status: "unknown" },
+        auth,
         message: "Grok CLI is installed but timed out while running `grok --version`.",
       },
     });
@@ -245,7 +293,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: true,
         version,
         status: "error",
-        auth: { status: "unknown" },
+        auth,
         message: "Grok CLI is installed but failed to run.",
       },
     });
@@ -268,7 +316,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: true,
         version,
         status: "error",
-        auth: { status: "unknown" },
+        auth,
         message: "Grok CLI is installed but ACP startup failed. Check server logs for details.",
       },
     });
@@ -286,7 +334,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
         installed: true,
         version,
         status: "error",
-        auth: { status: "unknown" },
+        auth,
         message: `Grok CLI is installed but ACP startup timed out after ${GROK_ACP_MODEL_DISCOVERY_TIMEOUT_MS}ms.`,
       },
     });
@@ -306,7 +354,7 @@ export const checkGrokProviderStatus = Effect.fn("checkGrokProviderStatus")(func
       installed: true,
       version,
       status: "ready",
-      auth: { status: "unknown" },
+      auth,
     },
   });
 });

@@ -37,6 +37,70 @@ describe("buildInitialGrokProviderSnapshot", () => {
 });
 
 it.layer(NodeServices.layer)("checkGrokProviderStatus", (it) => {
+  it.effect("surfaces the CLI's signed-in identity from its auth store", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-grok-auth-" });
+          const grokPath = path.join(dir, "grok");
+          yield* fs.writeFileString(
+            grokPath,
+            ["#!/bin/sh", 'printf "%s\n" "grok 9.9.9"', "exit 0", ""].join("\n"),
+          );
+          yield* fs.chmod(grokPath, 0o755);
+          const home = path.join(dir, "grok-home");
+          yield* fs.makeDirectory(home, { recursive: true });
+          // Shaped like the CLI's real store: identity beside token fields
+          // the decoder must remain structurally blind to.
+          yield* fs.writeFileString(
+            path.join(home, "auth.json"),
+            // @effect-diagnostics-next-line preferSchemaOverJson:off - fabricates the CLI's raw auth store.
+            JSON.stringify({
+              "https://auth.example::client": {
+                email: "person@example.com",
+                key: "token-material-that-must-never-surface",
+                refresh_token: "more-token-material",
+              },
+            }),
+          );
+          return yield* checkGrokProviderStatus(
+            decodeGrokSettings({ enabled: true, binaryPath: grokPath }),
+            { GROK_HOME: home },
+          );
+        }),
+      );
+      expect(snapshot.auth).toEqual({ status: "authenticated", email: "person@example.com" });
+    }),
+  );
+
+  it.effect("stays unknown when the auth store is missing or unreadable", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-grok-noauth-" });
+          const grokPath = path.join(dir, "grok");
+          yield* fs.writeFileString(
+            grokPath,
+            ["#!/bin/sh", 'printf "%s\n" "grok 9.9.9"', "exit 0", ""].join("\n"),
+          );
+          yield* fs.chmod(grokPath, 0o755);
+          const home = path.join(dir, "grok-home");
+          yield* fs.makeDirectory(home, { recursive: true });
+          yield* fs.writeFileString(path.join(home, "auth.json"), "not json at all");
+          return yield* checkGrokProviderStatus(
+            decodeGrokSettings({ enabled: true, binaryPath: grokPath }),
+            { GROK_HOME: home },
+          );
+        }),
+      );
+      expect(snapshot.auth).toEqual({ status: "unknown" });
+    }),
+  );
+
   it.effect("reports the binary as missing when the binary path does not resolve", () =>
     Effect.gen(function* () {
       const snapshot = yield* checkGrokProviderStatus(
