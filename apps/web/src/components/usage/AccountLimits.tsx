@@ -11,11 +11,11 @@
  * @module AccountLimits
  */
 import type { AccountLimitsSnapshot, AccountLimitsWindow } from "@t3tools/contracts";
+import { formatAgo, formatResetAt } from "@t3tools/shared/limitsFormat";
 import { useEffect, useState } from "react";
 
 import { cn } from "../../lib/utils";
 import { useAccountLimits } from "../../state/accountLimits";
-import { formatAgo, formatResetAt } from "../../usage/limitsFormat";
 import { PROVIDER_COLOR, PROVIDER_LABEL, PROVIDER_MARK, PROVIDER_ORDER } from "./usageProviders";
 
 /** Age past which a snapshot stops being "current" and earns a caption. */

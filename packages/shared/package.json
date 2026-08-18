@@ -199,6 +199,10 @@
       "types": "./src/httpReadiness.ts",
       "import": "./src/httpReadiness.ts"
     },
+    "./limitsFormat": {
+      "types": "./src/limitsFormat.ts",
+      "import": "./src/limitsFormat.ts"
+    },
     "./devHome": {
       "types": "./src/devHome.ts",
       "import": "./src/devHome.ts"
