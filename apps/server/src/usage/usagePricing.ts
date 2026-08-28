@@ -44,11 +44,19 @@ function finiteNumber(value: unknown): number | null {
  * Entries without both an input and an output rate are dropped: a half-priced
  * model would silently under-report cost, which is worse than reporting the
  * model as unpriced.
+ *
+ * Several LiteLLM keys can normalize to the same name: the document lists
+ * `claude-fable-5` and, thousands of lines later, reseller variants like
+ * `deepinfra/anthropic/claude-fable-5` that carry no cache rates and sometimes
+ * different base rates. A slash-free key is the canonical entry for the name
+ * transcripts actually record, so it always wins its slot; a prefix-stripped
+ * key only fills a slot no canonical entry claims.
  */
 export function parseRateTable(document: unknown): RateTable {
   const table = new Map<string, ModelRate>();
   if (typeof document !== "object" || document === null) return table;
 
+  const canonicalNames = new Set<string>();
   for (const [name, raw] of Object.entries(document as Record<string, unknown>)) {
     if (typeof raw !== "object" || raw === null) continue;
     const entry = raw as LiteLlmEntry;
@@ -56,7 +64,15 @@ export function parseRateTable(document: unknown): RateTable {
     const output = finiteNumber(entry.output_cost_per_token);
     if (input === null || output === null) continue;
 
-    table.set(normalizeModelName(name), {
+    const normalized = normalizeModelName(name);
+    const isCanonical = !name.includes("/");
+    if (isCanonical) {
+      canonicalNames.add(normalized);
+    } else if (canonicalNames.has(normalized)) {
+      continue;
+    }
+
+    table.set(normalized, {
       inputCostPerToken: input,
       outputCostPerToken: output,
       // Anthropic bills cache reads at a discount and cache writes at a
