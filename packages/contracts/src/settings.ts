@@ -265,6 +265,9 @@ export const ClientSettingsSchema = Schema.Struct({
   // default UI; this beta flag restores it (plus the /plan and /default slash
   // commands) for users who still rely on the old workflow.
   planModeEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  // Legacy context window meter. The composer hides it by default; users who
+  // still want the old usage indicator can restore it from Settings.
+  contextWindowMeterEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   showSkillsInSlashMenu: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   // Legacy sidebar (the original per-project tree). Deliberately a fresh key
   // (was `sidebarV2Enabled` + `sidebarV2ConfiguredByUser`): decoding drops the
@@ -297,10 +300,6 @@ export type ClientSettings = typeof ClientSettingsSchema.Type;
 export const DEFAULT_CLIENT_SETTINGS: ClientSettings = Schema.decodeSync(ClientSettingsSchema)({});
 
 // ── Server Settings (server-authoritative) ────────────────────
-
-// Moved to environment.ts so orchestration contracts can use it without an
-// import cycle; re-exported here for compatibility with deep imports.
-export { ThreadEnvMode } from "./environment.ts";
 
 const makeBinaryPathSetting = (fallback: string) =>
   TrimmedString.pipe(
@@ -994,6 +993,7 @@ export const ClientSettingsPatch = Schema.Struct({
     ),
   ),
   planModeEnabled: Schema.optionalKey(Schema.Boolean),
+  contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
   showSkillsInSlashMenu: Schema.optionalKey(Schema.Boolean),
   legacySidebarEnabled: Schema.optionalKey(Schema.Boolean),
   sidebarProjectGroupingMode: Schema.optionalKey(SidebarProjectGroupingMode),
