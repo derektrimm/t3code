@@ -22,9 +22,10 @@ Read the triage context file before investigating. It tells you the OS, whether
 the server process is currently running, and the exact paths for state, logs,
 and the database.
 
-The `Installed version` line is the version of the `t3` binary that wrote the
-context file, nothing more. `npx t3 triage` runs whichever `t3` npm resolved,
-which can be older than the desktop app or service the user actually runs.
+The `Installed version` and `Release tag for this version` lines describe the
+`t3` binary that wrote the context file, nothing more. `npx t3 triage` runs
+whichever `t3` npm resolved, which can be older than the desktop app or service
+the user actually runs.
 
 ## 3. Check for a newer playbook
 
@@ -41,9 +42,9 @@ the desktop app and its bundled server share a version. Treat that as a local
 fact to check against the user's answer, not as the answer: the bug may have
 been on another machine, a remote server, or a build they have since updated.
 
-Clone the repo at the tag matching the version the bug happened on, into the
-source cache directory named in the context file, one subdirectory per commit
-hash:
+Clone the repo at the tag for the version the bug happened on (`v` followed by
+that version), not the context file's release tag, into the source cache
+directory named in the context file, one subdirectory per commit hash:
 
     git clone --depth 1 --filter=blob:none --branch <release-tag> \
       https://github.com/pingdotgg/t3code <source-cache-dir>/<hash>
@@ -98,8 +99,9 @@ fixed in a release newer than the version the bug happened on: compare versions,
 read release notes and recent commits touching the relevant code.
 
 If the user is behind and the fix likely shipped, say so plainly and give them the
-exact update command for how they run the CLI (the context file records how it was
-launched).
+exact update steps for the build the bug happened on. The context file's
+`CLI launched as` line only says how `t3 triage` was started, which may not be
+how the affected app or service is installed.
 
 ## 7. Offer outcomes
 
