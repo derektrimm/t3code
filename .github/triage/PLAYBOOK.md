@@ -38,12 +38,16 @@ instead of this one. The user may be on an old release with an old copy.
 Before cloning, ask the user which version, device, and surface the bug happened
 on. If the context file says a server is running, also fetch
 `<origin>/.well-known/t3/environment` (no auth needed) and read `serverVersion`;
-the desktop app and its bundled server share a version. Treat that as a local
-fact to check against the user's answer, not as the answer: the bug may have
-been on another machine, a remote server, or a build they have since updated.
+the desktop app and its bundled server share a version. The recorded pid can
+belong to another process by now, so use the value only when the response is a
+T3 environment descriptor (it carries `environmentId` and `serverVersion`).
+Treat it as a local fact to check against the user's answer, not as the answer:
+the bug may have been on another machine, a remote server, or a build they have
+since updated.
 
-Clone the repo at the tag for the version the bug happened on (`v` followed by
-that version), not the context file's release tag, into the source cache
+Clone the repo at the tag for the version the bug happened on, not the context
+file's release tag. Tags are the bare version with one leading `v`, such as
+`v0.0.42` or `v0.0.43-nightly.20260923.2173`. Clone into the source cache
 directory named in the context file, one subdirectory per commit hash:
 
     git clone --depth 1 --filter=blob:none --branch <release-tag> \
