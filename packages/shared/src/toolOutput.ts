@@ -224,18 +224,25 @@ function outputBlocks(value: unknown): ReadonlyArray<unknown> {
 export const MAX_TOOL_OUTPUT_IMAGES = 8;
 
 /**
+ * The blocks `toolOutputImages` reads, by reference. These are the only image
+ * bytes in a tool output that a `tool-output-image` asset can serve.
+ */
+export function toolOutputImageBlocks(value: unknown): ReadonlyArray<unknown> {
+  const blocks: unknown[] = [];
+  for (const block of outputBlocks(value)) {
+    if (readToolOutputImage(block) === null) continue;
+    blocks.push(block);
+    if (blocks.length === MAX_TOOL_OUTPUT_IMAGES) break;
+  }
+  return blocks;
+}
+
+/**
  * The first images in a tool output, in order. The order is the
  * `tool-output-image` asset index, so servers and clients agree on it.
  */
 export function toolOutputImages(value: unknown): ReadonlyArray<ToolOutputImage> {
-  const images: ToolOutputImage[] = [];
-  for (const block of outputBlocks(value)) {
-    const image = readToolOutputImage(block);
-    if (image === null) continue;
-    images.push(image);
-    if (images.length === MAX_TOOL_OUTPUT_IMAGES) break;
-  }
-  return images;
+  return toolOutputImageBlocks(value).flatMap((block) => readToolOutputImage(block) ?? []);
 }
 
 /**
