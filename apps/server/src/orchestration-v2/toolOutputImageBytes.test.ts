@@ -1,5 +1,9 @@
 import { NodeId, ThreadId, TurnItemId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
-import { MAX_TOOL_OUTPUT_IMAGES, toolOutputImages } from "@t3tools/shared/toolOutput";
+import {
+  MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH,
+  MAX_TOOL_OUTPUT_IMAGES,
+  toolOutputImages,
+} from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
@@ -133,6 +137,34 @@ describe("stripUnservedToolOutputImageBytes", () => {
       { type: "image", mimeType: "image/png", sizeBytes: PNG_BYTES },
       { type: "image", mimeType: "image/png", sizeBytes: PNG_BYTES },
     ]);
+  });
+
+  it("strips a served-position image larger than an asset may serve", () => {
+    const oversized = "A".repeat(MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH + 4);
+    const servable = { type: "image", data: PNG_BASE64, mimeType: "image/png" };
+    const item = toolItem({
+      content: [
+        { type: "image", source: { type: "base64", media_type: "image/png", data: oversized } },
+        servable,
+      ],
+    });
+
+    const output = outputOf(stripUnservedToolOutputImageBytes(item)) as {
+      content: ReadonlyArray<unknown>;
+    };
+
+    expect(output.content).toEqual([
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          sizeBytes: ((MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH + 4) / 4) * 3,
+        },
+      },
+      servable,
+    ]);
+    expect(output.content[1]).toBe(servable);
   });
 
   it("keeps image fields whose value is not a base64 body", () => {

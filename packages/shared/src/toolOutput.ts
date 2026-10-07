@@ -1,4 +1,7 @@
-import { isProviderSendTurnSupportedImageMimeType } from "@t3tools/contracts";
+import {
+  isProviderSendTurnSupportedImageMimeType,
+  PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+} from "@t3tools/contracts";
 import * as Predicate from "effect/Predicate";
 
 import {
@@ -223,9 +226,14 @@ function outputBlocks(value: unknown): ReadonlyArray<unknown> {
 /** A tool returns one screenshot or a few frames; more would only flood the timeline. */
 export const MAX_TOOL_OUTPUT_IMAGES = 8;
 
+/** The largest image a `tool-output-image` asset serves: a provider turn's limit, as base64. */
+export const MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH =
+  Math.ceil(PROVIDER_SEND_TURN_MAX_IMAGE_BYTES / 3) * 4;
+
 /**
- * The blocks `toolOutputImages` reads, by reference. These are the only image
- * bytes in a tool output that a `tool-output-image` asset can serve.
+ * The blocks `toolOutputImages` reads, by reference. These hold the only image
+ * bytes in a tool output that a `tool-output-image` asset can serve, up to
+ * `MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH`.
  */
 export function toolOutputImageBlocks(value: unknown): ReadonlyArray<unknown> {
   const blocks: unknown[] = [];

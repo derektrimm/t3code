@@ -1,5 +1,9 @@
 import type { OrchestrationV2TurnItem } from "@t3tools/contracts";
-import { toolOutputImageBlocks } from "@t3tools/shared/toolOutput";
+import {
+  MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH,
+  readToolOutputImage,
+  toolOutputImageBlocks,
+} from "@t3tools/shared/toolOutput";
 
 const IMAGE_MIME_KEYS = ["mimeType", "mime_type", "media_type", "type"] as const;
 const IMAGE_BODY_KEYS = new Set(["data", "blob", "base64"]);
@@ -50,9 +54,12 @@ interface StripContext {
   served: ReadonlyArray<unknown> | undefined;
 }
 
+/** A block the asset route serves: in a served position and within its size limit. */
 function isServed(context: StripContext, record: UnknownRecord): boolean {
   context.served ??= toolOutputImageBlocks(context.output);
-  return context.served.includes(record);
+  if (!context.served.includes(record)) return false;
+  const data = readToolOutputImage(record)?.data;
+  return data === undefined || data.length <= MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH;
 }
 
 function strip(
@@ -110,8 +117,9 @@ function strip(
  *
  * Tools that read or capture an image return the whole file as base64, and a
  * turn item is stored twice: in the event log and in the projection. Only the
- * blocks `toolOutputImageBlocks` finds are ever read back; previews of a read
- * file load from `viewedImagePath`, and context handoff skips tool items.
+ * blocks `toolOutputImageBlocks` finds, within the asset size limit, are ever
+ * read back; previews of a read file load from `viewedImagePath`, and context
+ * handoff skips tool items.
  * Strings that are not a base64 body are kept, so identifiers and inline SVG
  * under the same keys survive. Containers are copied only when a descendant
  * changes; an item without such bytes is returned by reference.
