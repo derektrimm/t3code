@@ -952,10 +952,9 @@ describe("pasting into a path query", () => {
       typeof prompt === "string"
         ? ProseMirrorNode.fromJSON(schema, buildDocJson(prompt, skillLabelFor))
         : prompt;
-    const value = serializeEditorDoc(promptDoc).value;
-    const typed = promptDoc.lastChild!.lastChild;
-    const typedLength = typed?.isText ? typed.text!.length : 0;
-    const literalLength = pastedPathQueryLength(value, value.length, pasted, typedLength);
+    const line = promptDoc.lastChild!;
+    const lineBefore = line.textBetween(0, line.content.size, undefined, "\uFFFC");
+    const literalLength = pastedPathQueryLength(lineBefore, pasted);
     const blocks = buildTiptapContent(pasted, skillLabelFor, { literalLength });
     const [first, ...rest] = blocks.map((block) => ProseMirrorNode.fromJSON(schema, block));
     const head = promptDoc.lastChild!.content.append(first!.content);
@@ -1002,6 +1001,12 @@ describe("pasting into a path query", () => {
     expect(boldText(paste("Open ", "src/__test__.tsx"))).toEqual(["test"]);
     expect(boldText(paste("Open @a ", "__b__"))).toEqual(["b"]);
     expect(boldText(paste("Open @", " __b__"))).toEqual(["b"]);
+  });
+
+  it("keeps a path literal after a partly styled query", () => {
+    const doc = paste("Open @**src/**", "__test__.tsx");
+    expect(boldText(doc)).toEqual(["src/"]);
+    expect(serializeEditorDoc(doc).value).toBe("Open @**src/**__test__.tsx");
   });
 
   it("parses markdown pasted right after a mention chip", () => {

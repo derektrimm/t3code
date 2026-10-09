@@ -1405,19 +1405,17 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
           ) {
             text += " ";
           }
-          const map = serializeEditorDoc(view.state.doc);
-          const offset = flatToMarkdown(map, pmToFlat(map, view.state.selection.from));
           if (
             (tokens[0]?.type === "mention" || tokens[0]?.type === "skill") &&
             tokens[0].start === 0
           ) {
+            const map = serializeEditorDoc(view.state.doc);
+            const offset = flatToMarkdown(map, pmToFlat(map, view.state.selection.from));
             if (offset > 0 && !/\s/.test(map.value[offset - 1]!)) text = ` ${text}`;
           }
-          const typed = view.state.selection.$from.nodeBefore;
-          const typedLength = typed?.isText ? typed.text!.length : 0;
-          const literalLength = literalText
-            ? 0
-            : pastedPathQueryLength(map.value, offset, text, typedLength);
+          const { $from } = view.state.selection;
+          const lineBefore = $from.parent.textBetween(0, $from.parentOffset, undefined, "\uFFFC");
+          const literalLength = literalText ? 0 : pastedPathQueryLength(lineBefore, text);
           const editorInstance = editorHolder.current;
           if (editorInstance) {
             // Inside a list item or quote, pasted block markup has nowhere to

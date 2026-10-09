@@ -307,18 +307,13 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
 }
 
 /**
- * Length of the leading part of `pasted` that continues an `@` path query at
- * `cursor`. `typedLength` is the plain text directly before the cursor: a
- * query is typed text, while a mention chip serializes to the same `@path`.
+ * Length of the leading part of `pasted` that continues an `@` path query
+ * typed at the end of `lineBefore`, the line's plain text up to the caret. A
+ * chip must read there as one non-space character, so it never passes for a
+ * typed `@path`.
  */
-export function pastedPathQueryLength(
-  text: string,
-  cursor: number,
-  pasted: string,
-  typedLength: number,
-): number {
-  const trigger = detectComposerTrigger(text, cursor);
-  if (trigger?.kind !== "path" || cursor - trigger.rangeStart > typedLength) return 0;
+export function pastedPathQueryLength(lineBefore: string, pasted: string): number {
+  if (detectComposerTrigger(lineBefore, lineBefore.length)?.kind !== "path") return 0;
   return /^\S*/.exec(pasted)![0].length;
 }
 
