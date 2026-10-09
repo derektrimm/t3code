@@ -306,6 +306,22 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
   };
 }
 
+/**
+ * Length of the leading part of `pasted` that continues an `@` path query at
+ * `cursor`. `typedLength` is the plain text directly before the cursor: a
+ * query is typed text, while a mention chip serializes to the same `@path`.
+ */
+export function pastedPathQueryLength(
+  text: string,
+  cursor: number,
+  pasted: string,
+  typedLength: number,
+): number {
+  const trigger = detectComposerTrigger(text, cursor);
+  if (trigger?.kind !== "path" || cursor - trigger.rangeStart > typedLength) return 0;
+  return /^\S*/.exec(pasted)![0].length;
+}
+
 /** Caret and trigger after replacing composer text and continuing at the end. */
 export function composerStateAtPromptEnd(
   text: string,
