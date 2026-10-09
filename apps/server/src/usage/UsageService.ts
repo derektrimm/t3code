@@ -9,8 +9,9 @@
  * scans only reparse files that changed, and a file that merely grew resumes
  * from its cached parse position so only the appended bytes are read.
  * OpenCode's SQLite reader queries the live database each scan so WAL writes
- * remain visible. Antigravity databases are memoised in memory while the
- * database and its WAL keep the same `(size, mtime, ctime)`.
+ * remain visible. Antigravity databases are memoised while the database and its
+ * WAL keep the same `(size, mtime, ctime)`, and the memo is persisted so an
+ * unchanged history is not decoded again after a restart.
  *
  * Cursor's account API is slow, so its source answers from a cache and marks
  * itself `refreshing` while a background refresh runs; `awaitRefresh` waits
@@ -60,7 +61,13 @@ import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
 import { resolveAntigravityInstanceDirectories } from "../provider/antigravityAuthSupport.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { readOpenCodeUsage } from "./opencodeUsageReader.ts";
-import { makeAntigravityUsageCache, readAntigravityUsage } from "./antigravityUsageReader.ts";
+import {
+  ANTIGRAVITY_USAGE_CACHE_FILE_NAME,
+  decodeAntigravityUsageCache,
+  makeAntigravityUsageCache,
+  makeAntigravityUsageCacheWriter,
+  readAntigravityUsage,
+} from "./antigravityUsageReader.ts";
 import {
   CURSOR_ACCOUNT_CACHE_FILE_NAME,
   CURSOR_ACCOUNT_TTL_MS,
@@ -226,6 +233,7 @@ export const make = Effect.gen(function* () {
   /** Cursor account caches by credential source. */
   const cursorCaches = new Map<string, CursorAccountCache>();
   let cursorCacheDirty = false;
+  let antigravityCacheDirty = false;
   /**
    * The last failed refresh per credential source, standing for a TTL so a
    * client refetching a broken login does not refetch Cursor each time. A
@@ -246,6 +254,7 @@ export const make = Effect.gen(function* () {
   const scanCachePath = path.join(config.stateDir, SCAN_CACHE_FILE_NAME);
   const legacyScanCachePath = path.join(config.stateDir, LEGACY_SCAN_CACHE_FILE_NAME);
   const cursorCachePath = path.join(config.stateDir, CURSOR_ACCOUNT_CACHE_FILE_NAME);
+  const antigravityCachePath = path.join(config.stateDir, ANTIGRAVITY_USAGE_CACHE_FILE_NAME);
   const writeCacheFile = (filePath: string, contents: string) =>
     writeFileStringAtomically({ filePath, contents }).pipe(
       Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -449,6 +458,10 @@ export const make = Effect.gen(function* () {
       for (const [key, cache] of decodeCursorAccountCaches(yield* readDocument(cursorCachePath))) {
         cursorCaches.set(key, cache);
       }
+      const antigravityDocument = yield* readDocument(antigravityCachePath);
+      for (const [key, entry] of decodeAntigravityUsageCache(antigravityDocument)) {
+        antigravityCache.set(key, entry);
+      }
       let document = yield* readDocument(scanCachePath);
       if (document === null) {
         document = yield* readDocument(legacyScanCachePath);
@@ -466,6 +479,7 @@ export const make = Effect.gen(function* () {
   );
 
   const writeScanCache = makeScanCacheWriter();
+  const writeAntigravityCache = makeAntigravityUsageCacheWriter();
   // Scans with different windows can finish together; serializing the writes
   // keeps an older snapshot from landing after a newer one.
   const persistLock = yield* Semaphore.make(1);
@@ -484,6 +498,17 @@ export const make = Effect.gen(function* () {
         Effect.catchCause(() =>
           Effect.sync(() => {
             cacheDirty = true;
+          }),
+        ),
+      );
+    }
+    if (antigravityCacheDirty) {
+      antigravityCacheDirty = false;
+      yield* Effect.sync(() => writeAntigravityCache(antigravityCache)).pipe(
+        Effect.flatMap((contents) => writeCacheFile(antigravityCachePath, contents)),
+        Effect.catchCause(() =>
+          Effect.sync(() => {
+            antigravityCacheDirty = true;
           }),
         ),
       );
@@ -909,6 +934,7 @@ export const make = Effect.gen(function* () {
       const result = yield* Effect.promise(() =>
         readAntigravityUsage([...antigravityDirs], windowStartMs, antigravityCache),
       );
+      if (result.cacheChanged) antigravityCacheDirty = true;
       const scanned: ScannedDir[] = [];
       for (const dir of antigravityDirs) {
         const exists = yield* fileSystem

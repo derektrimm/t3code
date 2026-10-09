@@ -16,6 +16,7 @@ import {
   ProviderInstanceId,
   UsageDay,
   type UsageSource,
+  type UsageSummary,
   type UsageSummaryInput,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
@@ -162,6 +163,40 @@ const replaceFile = (path: string, content: string) =>
     await NodeFSP.writeFile(path + ".next", content);
     await NodeFSP.rename(path + ".next", path);
   });
+
+function protoNumber(field: number, value: number): number[] {
+  const varint = (number: number) => {
+    const bytes: number[] = [];
+    do {
+      const byte = number % 128;
+      number = Math.floor(number / 128);
+      bytes.push(byte + (number > 0 ? 128 : 0));
+    } while (number > 0);
+    return bytes;
+  };
+  return [...varint(field * 8), ...varint(value)];
+}
+
+function protoBytes(field: number, bytes: readonly number[]): number[] {
+  const encoded = protoNumber(field, bytes.length);
+  encoded[0] = encoded[0]! + 2;
+  return [...encoded, ...bytes];
+}
+
+/** One Antigravity generation inside `WINDOW` with `outputTokens` of output. */
+function antigravityGeneration(responseId: string, outputTokens: number): Uint8Array {
+  return new Uint8Array(
+    protoBytes(1, [
+      ...protoBytes(4, [
+        ...protoNumber(2, 100),
+        ...protoNumber(3, outputTokens),
+        ...protoBytes(11, [...Buffer.from(responseId)]),
+      ]),
+      ...protoBytes(19, [...Buffer.from("Gemini 3 Pro")]),
+      ...protoBytes(9, protoBytes(4, protoNumber(1, Date.parse("2026-08-01T10:00:00Z") / 1000))),
+    ]),
+  );
+}
 
 function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens: number } }[] }) {
   return summary.buckets.reduce((sum, bucket) => sum + bucket.totals.outputTokens, 0);
@@ -667,6 +702,48 @@ describe("UsageService", () => {
           1,
         );
       }).pipe(Effect.scoped),
+  );
+
+  it.live("restores unchanged Antigravity history after a restart without reading it", () =>
+    Effect.gen(function* () {
+      const { settings, home } = yield* setup;
+      const conversations = NodePath.join(home, "antigravity", "conversations");
+      const db = yield* Effect.acquireRelease(
+        Effect.promise(async () => {
+          await NodeFSP.mkdir(conversations, { recursive: true });
+          const db = new NodeSqlite.DatabaseSync(NodePath.join(conversations, "session-1.db"));
+          db.exec("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)");
+          db.prepare("INSERT INTO gen_metadata VALUES (?, ?)").run(
+            0,
+            antigravityGeneration("r-1", 40),
+          );
+          return db;
+        }),
+        (db) => Effect.sync(() => db.close()),
+      );
+      const antigravitySource = (summary: UsageSummary) =>
+        summary.sources.find((source) => source.fingerprint.provider === "antigravity");
+      yield* Effect.gen(function* () {
+        const first = yield* UsageService.make;
+        const original = yield* first.readSummary(WINDOW);
+        assert.strictEqual(antigravitySource(original)?.status, "ok");
+        assert.strictEqual(totalOutputTokens(original), 40);
+        yield* first.awaitPersisted;
+
+        // An exclusive lock makes any read of the database fail, so after the
+        // restart only the saved cache can still report its usage.
+        db.exec("BEGIN EXCLUSIVE");
+        const restarted = yield* UsageService.make;
+        const restored = yield* restarted.readSummary(WINDOW);
+        db.exec("ROLLBACK");
+        assert.strictEqual(antigravitySource(restored)?.status, "ok");
+        assert.deepStrictEqual(restored.buckets, original.buckets);
+      }).pipe(
+        Effect.provide(
+          layerService({ prefix: "usage-service-antigravity-restart", home, settings }),
+        ),
+      );
+    }).pipe(Effect.scoped),
   );
 
   it.live("counts aliased OpenCode and Antigravity directories once", () =>

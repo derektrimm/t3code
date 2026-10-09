@@ -11,7 +11,12 @@ import { afterEach, assert, beforeEach, describe, it } from "@effect/vitest";
 import { readTranscriptRecords } from "./usageTranscriptReader.ts";
 import { readOpenCodeUsage } from "./opencodeUsageReader.ts";
 import { readCursorAccountUsage } from "./cursorUsageReader.ts";
-import { makeAntigravityUsageCache, readAntigravityUsage } from "./antigravityUsageReader.ts";
+import {
+  decodeAntigravityUsageCache,
+  makeAntigravityUsageCache,
+  makeAntigravityUsageCacheWriter,
+  readAntigravityUsage,
+} from "./antigravityUsageReader.ts";
 
 let dir: string;
 
@@ -771,6 +776,60 @@ describe("SQLite usage readers", () => {
         ["antigravity:11:r-1"],
       );
       db.exec("ROLLBACK");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("serves a saved Antigravity cache after a restart without reading the database", async () => {
+    const path = NodePath.join(dir, "session-1.db");
+    const db = new NodeSqlite.DatabaseSync(path);
+    try {
+      db.exec("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)");
+      const insert = db.prepare("INSERT INTO gen_metadata VALUES (?, ?)");
+      insert.run(0, antigravityGeneration("r-1"));
+      // No response id, so its dedupe key is not an alias and is saved as is.
+      insert.run(1, antigravityGeneration(""));
+      const cache = makeAntigravityUsageCache();
+      const first = await readAntigravityUsage(dir, 0, cache);
+      assert.isTrue(first.cacheChanged);
+      const saved = JSON.parse(makeAntigravityUsageCacheWriter()(cache));
+
+      db.exec("BEGIN EXCLUSIVE");
+      const restored = decodeAntigravityUsageCache(saved);
+      const second = await readAntigravityUsage(dir, 0, restored);
+      assert.deepStrictEqual(second.errors, []);
+      assert.isFalse(second.cacheChanged);
+      assert.deepStrictEqual(
+        second.files.flatMap((file) => file.records).map((record) => record.dedupeKey),
+        ["antigravity:11:r-1", "antigravity:session-1:generation:1:0"],
+      );
+      assert.deepStrictEqual(
+        second.files.flatMap((file) => file.records),
+        first.files.flatMap((file) => file.records),
+      );
+      db.exec("ROLLBACK");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("drops a corrupt saved Antigravity database instead of serving part of it", async () => {
+    const path = NodePath.join(dir, "session-1.db");
+    const db = new NodeSqlite.DatabaseSync(path);
+    try {
+      db.exec("CREATE TABLE gen_metadata (idx INTEGER, data BLOB)");
+      const insert = db.prepare("INSERT INTO gen_metadata VALUES (?, ?)");
+      insert.run(0, antigravityGeneration("r-1"));
+      insert.run(1, antigravityGeneration("r-2"));
+      const cache = makeAntigravityUsageCache();
+      await readAntigravityUsage(dir, 0, cache);
+      const saved = JSON.parse(makeAntigravityUsageCacheWriter()(cache));
+      const [entry] = Object.values(saved.files) as Array<{ c: unknown[][] }>;
+      entry!.c[1]![5] = -1;
+
+      assert.strictEqual(decodeAntigravityUsageCache(saved).size, 0);
+      assert.strictEqual(decodeAntigravityUsageCache({ ...saved, version: 2 }).size, 0);
     } finally {
       db.close();
     }
