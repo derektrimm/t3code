@@ -65,4 +65,43 @@ describe("mergeProviderInstanceEnvironment", () => {
       PATH: "/bin",
     });
   });
+
+  it("keeps the AppImage runtime and the Electron-as-Node flag out of agent sessions", () => {
+    const appDir = "/tmp/.mount_T3-Codeabc123";
+
+    expect(
+      mergeProviderInstanceEnvironment(undefined, {
+        APPIMAGE: "/home/user/T3-Code.AppImage",
+        APPDIR: appDir,
+        ARGV0: "/home/user/T3-Code.AppImage",
+        OWD: "/home/user/project",
+        ELECTRON_RUN_AS_NODE: "1",
+        PATH: `${appDir}:${appDir}/usr/sbin:/usr/local/bin:/usr/bin`,
+        LD_LIBRARY_PATH: `${appDir}/usr/lib`,
+        HOME: "/home/user",
+      }),
+    ).toEqual({ PATH: "/usr/local/bin:/usr/bin", HOME: "/home/user" });
+  });
+
+  it("drops only the Electron-as-Node flag outside an AppImage", () => {
+    expect(
+      mergeProviderInstanceEnvironment([], {
+        ELECTRON_RUN_AS_NODE: "1",
+        OWD: "/home/user/keep-this",
+        PATH: "/usr/bin",
+      }),
+    ).toEqual({ OWD: "/home/user/keep-this", PATH: "/usr/bin" });
+  });
+
+  it("applies provider settings after the scrub", () => {
+    expect(
+      mergeProviderInstanceEnvironment(
+        [
+          { name: "ELECTRON_RUN_AS_NODE", value: "1", sensitive: false },
+          { name: "APPDIR", value: "/opt/configured", sensitive: false },
+        ],
+        { APPIMAGE: "/home/user/T3-Code.AppImage", APPDIR: "/tmp/.mount_T3-x", PATH: "/usr/bin" },
+      ),
+    ).toEqual({ ELECTRON_RUN_AS_NODE: "1", APPDIR: "/opt/configured", PATH: "/usr/bin" });
+  });
 });
