@@ -74,7 +74,7 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as OpenCode2Client from "./OpenCode2Client.ts";
 import * as OpenCode2Server from "./OpenCode2Server.ts";
 import * as OpenCodeRuntime from "../OpenCodeRuntime.ts";
-import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import { t3OrchestrationSystemPrompt } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
@@ -88,7 +88,7 @@ import {
   backgroundWorkNotification,
   type BackgroundWorkReport,
 } from "@t3tools/provider-core/server/notification";
-import * as ProviderContinuationRequests from "@t3tools/provider-core/server/continuationRequests";
+import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
   makeSubagentChildThread,
@@ -345,6 +345,8 @@ interface ThreadState {
    * rules stay in force, and a changed mode switches it before prompting.
    */
   agent: string;
+  /** The native session's title as T3 last read or wrote it. */
+  title: string | undefined;
   /** The native session's rules as T3 last read or wrote them, and the policy they are for. */
   rules: ReadonlyArray<Rule> | undefined;
   policy: RulesPolicy;
@@ -831,6 +833,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   const server = yield* OpenCode2Server.OpenCode2Server;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const host = yield* ProviderHost.ProviderHost;
+  const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
   const crypto = yield* Crypto.Crypto;
   const driver = OPENCODE_PROVIDER;
@@ -858,7 +861,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
   });
 
   const openSession = Effect.fn("OpenCode2Adapter.openSession")(function* (
-    input: Parameters<ProviderAdapter.ProviderAdapterV2Shape["openSession"]>[0],
+    input: Parameters<ProviderAdapter.ProviderAdapterV2["Service"]["openSession"]>[0],
     initial: {
       readonly connection: OpenCode2Server.OpenCode2Connection;
       readonly scope: Scope.Closeable;
@@ -933,6 +936,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       unsettled: false,
       directory,
       agent: "build",
+      title: undefined,
       rules: undefined,
       policy: input.runtimePolicy,
       grants: [],
@@ -3011,12 +3015,22 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state.policy = policy;
     });
 
+    /** Names the session after its thread when they differ. */
+    const writeTitle = Effect.fnUntraced(function* (state: ThreadState, title: string) {
+      const next = title.trim();
+      // An empty title asks OpenCode to generate one.
+      if (next === "" || next === state.title) return;
+      yield* client.session.update({ sessionID: Session.ID.make(state.sessionId), title: next });
+      state.title = next;
+    });
+
     const register = (
       providerThread: OrchestrationV2ProviderThread,
       native: {
         readonly id: string;
         readonly model?: ModelRef | undefined;
         readonly agent?: string | undefined;
+        readonly title?: string | undefined;
         readonly permissions?: ReadonlyArray<Rule> | undefined;
       },
       directory: string,
@@ -3028,12 +3042,14 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         existing.model = native.model;
         existing.directory = directory;
         existing.agent = native.agent ?? existing.agent;
+        existing.title = native.title;
         existing.rules = native.permissions;
         return existing;
       }
       const state = newThreadState(native.id, providerThread, directory, undefined);
       state.model = native.model;
       state.agent = native.agent ?? state.agent;
+      state.title = native.title;
       state.rules = native.permissions;
       threads.set(native.id, state);
       return state;
@@ -3251,7 +3267,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state: ThreadState,
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
     ) {
-      const mcpSession = McpProviderSession.readMcpProviderSession(turnInput.threadId);
+      const mcpSession = yield* mcpSessions.read(turnInput.threadId);
       const directory = turnInput.runtimePolicy.cwd ?? host.paths.cwd;
       const name = yield* mcpServerNameFor(turnInput.threadId);
       // An external server may not reach T3's MCP endpoint, as with 1.x.
@@ -3614,10 +3630,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             policy,
             threadInput.threadId,
           );
+          const title = threadInput.title?.trim() || undefined;
+          // A session created with a title is never titled by OpenCode's own model.
           const created = yield* client.session.create({
             location: Location.PublicRef.make({ directory: AbsolutePath.make(directory) }),
             model,
             permissions,
+            ...(title === undefined ? {} : { title }),
           });
           const createdAt = yield* DateTime.now;
           const providerThread: OrchestrationV2ProviderThread = {
@@ -3641,7 +3660,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           };
           const state = register(
             providerThread,
-            { id: created.id, model: created.model, agent: created.agent, permissions },
+            {
+              id: created.id,
+              model: created.model,
+              agent: created.agent,
+              title: title ?? created.title,
+              permissions,
+            },
             directory,
           );
           state.policy = policy;
@@ -3800,6 +3825,11 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               // and its subagents still running hold the rules they started with.
               // Those run on whether or not this turn starts, so theirs are best effort.
               yield* writeRules(state, turnInput.runtimePolicy);
+              // A thread renamed since the last turn, or titled after its first prompt.
+              yield* writeTitle(state, turnInput.appThread.title).pipe(
+                Effect.timeout(REQUEST_REPLY_TIMEOUT),
+                Effect.ignore({ log: true }),
+              );
               for (const call of runningCalls(state)) {
                 if (call.child === undefined) continue;
                 yield* writeRules(call.child, turnInput.runtimePolicy).pipe(
