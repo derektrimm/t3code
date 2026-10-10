@@ -947,14 +947,14 @@ describe("pasting into a path query", () => {
 
   // Inserts `pasted` at the end of a one-line prompt the way the composer's
   // paste handler does. `prompt` may be a document, to place the caret after a chip.
-  function paste(prompt: string | ProseMirrorNode, pasted: string) {
+  function paste(prompt: string | ProseMirrorNode, pasted: string, pathQueryActive = true) {
     const promptDoc =
       typeof prompt === "string"
         ? ProseMirrorNode.fromJSON(schema, buildDocJson(prompt, skillLabelFor))
         : prompt;
     const line = promptDoc.lastChild!;
     const lineBefore = line.textBetween(0, line.content.size, undefined, "\uFFFC");
-    const literalLength = pastedPathQueryLength(lineBefore, pasted);
+    const literalLength = pastedPathQueryLength(lineBefore, pasted, pathQueryActive);
     const blocks = buildTiptapContent(pasted, skillLabelFor, { literalLength });
     const [first, ...rest] = blocks.map((block) => ProseMirrorNode.fromJSON(schema, block));
     const head = promptDoc.lastChild!.content.append(first!.content);
@@ -989,6 +989,12 @@ describe("pasting into a path query", () => {
     expect(serializeEditorDoc(doc).value).toBe(
       "Open @src/__test__.tsx and **this**\n- [ ] then **that**",
     );
+  });
+
+  it("parses markdown after Escape dismisses the path query", () => {
+    const doc = paste("Open @", "__hello__ world", false);
+    expect(boldText(doc)).toEqual(["hello"]);
+    expect(serializeEditorDoc(doc).value).toBe("Open @**hello** world");
   });
 
   it("keeps the rest of the path's line on that line", () => {

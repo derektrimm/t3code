@@ -312,7 +312,12 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
  * chip must read there as one non-space character, so it never passes for a
  * typed `@path`.
  */
-export function pastedPathQueryLength(lineBefore: string, pasted: string): number {
+export function pastedPathQueryLength(
+  lineBefore: string,
+  pasted: string,
+  pathQueryActive = true,
+): number {
+  if (!pathQueryActive) return 0;
   if (detectComposerTrigger(lineBefore, lineBefore.length)?.kind !== "path") return 0;
   return /^\S*/.exec(pasted)![0].length;
 }

@@ -161,6 +161,8 @@ export interface ComposerPromptEditorProps {
   suggestionListId?: string | undefined;
   /** References the highlighted option only while its list is rendered. */
   activeSuggestionId?: string | undefined;
+  /** Reads suggestion state at paste time, including Escape dismissal. */
+  isPathQueryActive?: () => boolean;
   containerClassName?: string;
   className?: string;
   placeholderClassName?: string;
@@ -821,6 +823,7 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
     ariaLabel,
     suggestionListId,
     activeSuggestionId,
+    isPathQueryActive,
     containerClassName,
     className,
     placeholderClassName,
@@ -856,6 +859,7 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
   const onChangeRef = useRef(onChange);
   const onVisibleSelectionChangeRef = useRef(onVisibleSelectionChange);
   const onCommandKeyDownRef = useRef(onCommandKeyDown);
+  const isPathQueryActiveRef = useRef(isPathQueryActive);
   const buildFragmentRef = useRef(buildContextClipboardFragment);
   const importFragmentRef = useRef(importContextFragment);
   const skillsRef = useRef(skills);
@@ -873,6 +877,9 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
   useEffect(() => {
     onCommandKeyDownRef.current = onCommandKeyDown;
   }, [onCommandKeyDown]);
+  useEffect(() => {
+    isPathQueryActiveRef.current = isPathQueryActive;
+  }, [isPathQueryActive]);
   useEffect(() => {
     buildFragmentRef.current = buildContextClipboardFragment;
   }, [buildContextClipboardFragment]);
@@ -1415,7 +1422,9 @@ function ComposerPromptEditorTiptapInner(props: ComposerPromptEditorProps) {
           }
           const { $from } = view.state.selection;
           const lineBefore = $from.parent.textBetween(0, $from.parentOffset, undefined, "\uFFFC");
-          const literalLength = literalText ? 0 : pastedPathQueryLength(lineBefore, text);
+          const literalLength = literalText
+            ? 0
+            : pastedPathQueryLength(lineBefore, text, isPathQueryActiveRef.current?.());
           const editorInstance = editorHolder.current;
           if (editorInstance) {
             // Inside a list item or quote, pasted block markup has nowhere to
